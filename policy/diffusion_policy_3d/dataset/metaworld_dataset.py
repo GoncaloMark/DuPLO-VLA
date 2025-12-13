@@ -84,20 +84,23 @@ class MetaworldDataset(BaseDataset):
     def _sample_to_data(self, sample):
         agent_pos = sample['state'].astype(np.float32)
         point_cloud = sample['point_cloud'].astype(np.float32)
-
+        rgb_image = sample['img'].astype(np.uint8)
+        
         instruction = sample['instruction']
         if isinstance(instruction, np.ndarray):
             instruction = instruction.tolist()
-            instruction = [str(x) for x in instruction]
-
-        rgb_image = sample['img'].astype(np.uint8)
+            if isinstance(instruction, list):
+                # Take ONLY the first instruction (they're all identical anyway)
+                instruction = str(instruction[0])
+            else:
+                instruction = str(instruction)
 
         data = {
             'obs': {
                 'point_cloud': point_cloud,
                 'agent_pos': agent_pos,
-                'instruction': instruction,
-                'rgb_image': rgb_image,  # <-- NEW
+                'instruction': instruction,  
+                'rgb_image': rgb_image,
             },
             'action': sample['action'].astype(np.float32)
         }
