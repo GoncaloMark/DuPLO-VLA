@@ -252,7 +252,7 @@ def run_overfitting_test():
             obs_dict[k] = v
 
     actions = batch['action'].to(device)
-    instructions = batch['obs']['instruction'][:, batch_size]
+    instructions = batch['obs']['instruction'][:obs_dict['rgb_image'].shape[0]]
     
     train_sampling_batch = {
         'obs': obs_dict,
