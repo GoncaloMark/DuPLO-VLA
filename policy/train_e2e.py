@@ -23,6 +23,30 @@ from diffusion_policy_3d.policy.dp3 import DP3
 from diffusion_policy_3d.model.diffusion.ema_model import EMAModel
 from diffusion_policy_3d.dataset.metaworld_dataset import MetaworldDataset
 
+class MetaWrapper:
+    def __init__(self, data):
+        self.data = data
+    def __getitem__(self, key):
+        return self.data[key]
+    def __repr__(self):
+        return f"Wrapper({self.data})"
+
+def prepare_meta(data):
+    if isinstance(data, dict):
+        if 'shape' in data: 
+            return MetaWrapper(data)
+        else:
+            return {k: prepare_meta(v) for k, v in data.items()}
+    return data
+
+class ConfigWrapper(dict):
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name)
+
+
 class EndToEndRobotPolicy(nn.Module):
     """
     Dual-process VLA combining System 2 (VLM planner) with System 1 (DP3 policy)
@@ -81,8 +105,10 @@ class EndToEndRobotPolicy(nn.Module):
                 task_type="CAUSAL_LM"
             )
             self.planner.vlm = get_peft_model(self.planner.vlm, lora_config)
-            print(f"LoRA applied to VLM. Trainable params: {self.planner.vlm.print_trainable_parameters()}")
-        
+            print(f"LoRA applied to VLM. Trainable params")
+            
+
+
         noise_scheduler = DDIMScheduler(
             num_train_timesteps=num_train_timesteps,
             beta_start=beta_start,
@@ -92,7 +118,7 @@ class EndToEndRobotPolicy(nn.Module):
             set_alpha_to_one=True,
             steps_offset=0,
             prediction_type="sample"
-        )
+            )
         
         # shape_meta add task_latent
         self.shape_meta = shape_meta.copy()
@@ -101,6 +127,9 @@ class EndToEndRobotPolicy(nn.Module):
             'type': 'low_dim'
         }
         
+        self.shape_meta = prepare_meta(self.shape_meta)
+        print(self.shape_meta)
+
         # System 1
         self.policy = DP3(
             shape_meta=self.shape_meta,
@@ -123,17 +152,20 @@ class EndToEndRobotPolicy(nn.Module):
             obs_as_global_cond=obs_as_global_cond,
             use_pc_color=use_pc_color,
             pointnet_type=pointnet_type,
-            pointcloud_encoder_cfg={
-                'in_channels': 3,
-                'out_channels': encoder_output_dim,
-                'use_layernorm': True,
-                'final_norm': 'layernorm',
-                'normal_channel': False
-            }
+            pointcloud_encoder_cfg = ConfigWrapper({'in_channels': 6,'out_channels': encoder_output_dim,'use_layernorm': True,'final_norm': 'layernorm','normal_channel': False})
         )
         
         self.latent_dim = latent_dim
         self.n_obs_steps = n_obs_steps
+
+    def to(self, device):
+        """Override to() to ensure all submodules move correctly"""
+        super().to(device)
+        # Explicitly move the policy and planner
+        self.policy = self.policy.to(device)
+        self.planner.vlm = self.planner.vlm.to(device)
+        self.planner.task_encoder = self.planner.task_encoder.to(device)
+        return self
 
     def forward(
         self,
@@ -153,19 +185,20 @@ class EndToEndRobotPolicy(nn.Module):
             actions: (B, T, A) ground truth actions
             compute_loss: Whether to compute loss
         """
-        batch_size = len(instruction_text)
+        batch_size = obs_dict['point_cloud'].shape[0]
         
         # System 2
         task_latents = []
         for i in range(batch_size):
-            if 'rgb' in obs_dict:
-                rgb_image = obs_dict['rgb'][i, 0]  # (C, H, W)
+            if 'rgb_image' in obs_dict:
+                rgb_image = obs_dict['rgb_image'][i,0]
             
             latent, _ = self.planner.plan(
                 image=rgb_image,
                 instruction=instruction_text[i],
                 get_text=False
             )
+            latent = latent.squeeze()
             task_latents.append(latent)
         
         # Stack latents: (B, latent_dim)
@@ -175,15 +208,22 @@ class EndToEndRobotPolicy(nn.Module):
         T = obs_dict['point_cloud'].shape[1]
         task_latents_expanded = task_latents.unsqueeze(1).expand(-1, T, -1)
         
-        obs_dict_with_task = obs_dict.copy()
-        obs_dict_with_task['task_latent'] = task_latents_expanded
-        
+        device = next(self.policy.parameters()).device
+    
+        obs_dict_with_task = {
+           k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in obs_dict.items()
+            if k not in ['instruction', 'rgb_image']
+        } 
+        obs_dict_with_task['task_latent'] = task_latents_expanded.to(device) 
+         
         # System 1
         if compute_loss and actions is not None:
             batch = {
                 'obs': obs_dict_with_task,
-                'action': actions
+                'action': actions.to(device)
             }
+
             loss, loss_dict = self.policy.compute_loss(batch)
             return loss, loss_dict
         else:
@@ -255,6 +295,11 @@ class EndToEndTrainer:
         
         # normalizer
         normalizer = train_dataset.get_normalizer()
+        normalizer.params_dict['task_latent'] = nn.ParameterDict({
+            'mean': torch.zeros(latent_dim),
+            'std': torch.ones(latent_dim)
+        })
+
         self.model.policy.set_normalizer(normalizer)
         
         self.optimizer = self._setup_optimizer(

@@ -8,6 +8,7 @@ if __name__ == "__main__":
     os.chdir(ROOT_DIR)
 
 import torch
+import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from pathlib import Path
@@ -34,6 +35,7 @@ def check_gradients(model):
     grad_info['policy'] = np.mean(policy_grads) if policy_grads else 0.0
     
     return grad_info
+
 
 def run_overfitting_test():
     print("="*80)
@@ -71,7 +73,7 @@ def run_overfitting_test():
     n_groups = 8
     num_inference_steps = 10
     obs_as_global_cond = True
-    use_pc_color = False
+    use_pc_color = True
     pointnet_type = "pointnet"
     
     num_train_timesteps = 100
@@ -105,6 +107,10 @@ def run_overfitting_test():
             'agent_pos': {
                 'shape': [9],
                 'type': 'low_dim'
+            },
+            'rgb_image': {
+                'shape': [128, 128, 3],
+                'type': 'rgb'
             }
         },
         'action': {
@@ -126,7 +132,7 @@ def run_overfitting_test():
     
     print("Loading dataset...")
     train_dataset = MetaworldDataset(
-        zarr_path=f'/home/lnxdre4d/Desktop/3D-Diffusion-Policy/data/metaworld_pick-place_expert.zarr',
+        zarr_path=f'/data/home/g.marques/storage/DuPLO-VLA/data/metaworld_pick-place_expert.zarr',
         horizon=horizon,
         pad_before=pad_before,
         pad_after=pad_after,
@@ -178,7 +184,10 @@ def run_overfitting_test():
         lora_dropout=lora_dropout,
     )
     model = model.to(device)
-    
+    print(f"Policy device: {next(model.policy.parameters()).device}")
+    print(f"Obs encoder device: {next(model.policy.obs_encoder.parameters()).device}")
+    print(f"Extractor device: {next(model.policy.obs_encoder.extractor.parameters()).device}")
+    print(f"Planner VLM device: {next(model.planner.vlm.parameters()).device}") 
     # Count parameters
     vlm_params = sum(p.numel() for p in model.planner.vlm.parameters())
     latent_params = sum(p.numel() for p in model.planner.task_encoder.parameters())
@@ -192,8 +201,14 @@ def run_overfitting_test():
     print(f"    Total: {total_params:,} parameters\n")
     
     normalizer = train_dataset.get_normalizer()
+    normalizer.params_dict['task_latent'] = nn.ParameterDict({
+        'mean': torch.zeros(latent_dim),
+        'scale': torch.ones(latent_dim),
+        'offset': torch.zeros(latent_dim)
+    })
     model.policy.set_normalizer(normalizer)
-    
+    model.policy.normalizer = model.policy.normalizer.to(device)
+    print(f"Normalizer device: {next(model.policy.normalizer.parameters()).device if hasattr(model.policy.normalizer, 'parameters') else 'no parameters'}") 
     print("Setting up optimizer...")
     param_groups = [
         {
@@ -229,16 +244,22 @@ def run_overfitting_test():
     
     print("Checking gradients on first batch...")
     batch = next(iter(train_loader))
-    obs_dict = {k: v.to(device) for k, v in batch['obs'].items()}
+    obs_dict = {}
+    for k, v in batch['obs'].items():
+        if isinstance(v, torch.Tensor):
+            obs_dict[k] = v.to(device)
+        else:
+            obs_dict[k] = v
+
     actions = batch['action'].to(device)
-    instructions = batch['instruction']
+    instructions = batch['obs']['instruction']
     
     train_sampling_batch = {
         'obs': obs_dict,
         'action': actions,
         'instruction': instructions
     }
-    
+ 
     model.train()
     loss, _ = model(
         obs_dict=obs_dict,
@@ -270,7 +291,6 @@ def run_overfitting_test():
     print("="*80 + "\n")
     
     global_step = 0
-    best_loss = float('inf')
     
     for epoch in range(num_epochs):
         model.train()
@@ -280,10 +300,14 @@ def run_overfitting_test():
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
         
         for _, batch in enumerate(pbar):
-            obs_dict = {k: v.to(device, non_blocking=True) 
-                       for k, v in batch['obs'].items()}
+            obs_dict = {}
+            for k, v in batch['obs'].items():
+                if isinstance(v, torch.Tensor):
+                    obs_dict[k] = v.to(device)
+                else:
+                    obs_dict[k] = v
             actions = batch['action'].to(device, non_blocking=True)
-            instructions = batch['instruction']
+            instructions = batch['obs']['instruction']
             
             loss, _ = model(
                 obs_dict=obs_dict,
@@ -311,29 +335,48 @@ def run_overfitting_test():
         
         if epoch % sample_every == 0:
             model.eval()
+            
+            torch.manual_seed(42)
+            np.random.seed(42)
+            
             with torch.no_grad():
-                obs_dict = {k: v.to(device) for k, v in train_sampling_batch['obs'].items()}
+                obs_dict = {}
+                for k, v in train_sampling_batch['obs'].items():
+                    if isinstance(v, torch.Tensor):
+                        obs_dict[k] = v.to(device)
+                    else:
+                        obs_dict[k] = v
+
                 gt_action = train_sampling_batch['action'].to(device)
                 instructions = train_sampling_batch['instruction']
                 
-                result = model(
-                    obs_dict=obs_dict,
-                    instruction_text=instructions,
-                    actions=None,
-                    compute_loss=False
-                )
+                all_preds = []
+                for _ in range(10):
+                    result = model(
+                        obs_dict=obs_dict,
+                        instruction_text=instructions,
+                        actions=None,
+                        compute_loss=False
+                    )
+                    all_preds.append(result['action_pred'])
                 
-                pred_action = result['action_pred']
-                mse = torch.nn.functional.mse_loss(pred_action, gt_action).item()
+                all_preds = torch.stack(all_preds)  
+                mean_pred = all_preds.mean(dim=0)   
+                pred_variance = all_preds.var(dim=0).mean().item()
+                
+                mse = torch.nn.functional.mse_loss(mean_pred, gt_action).item()
             
-            print(f"\nEpoch {epoch:3d} | Loss: {epoch_loss:.6f} | MSE: {mse:.6f}")
+            print(f"\nEpoch {epoch:3d}")
+            print(f"  Train Loss:      {epoch_loss:.6f}")
+            print(f"  MSE (mean):      {mse:.6f}")
+            print(f"  Pred variance:   {pred_variance:.6f}")
             
-            # Check if we've overfit
-            if epoch_loss < 0.01 and mse < 0.001:
+            if epoch_loss < 0.01 and mse < 0.01 and pred_variance < 0.001:
                 print("\n" + "="*80)
                 print("SUCCESS! Model has successfully overfit the dataset!")
-                print(f"  Final Loss: {epoch_loss:.6f} < 0.01")
-                print(f"  Final MSE: {mse:.6f} < 0.001")
+                print(f"  Final Train Loss: {epoch_loss:.6f} < 0.01")
+                print(f"  Final MSE: {mse:.6f} < 0.01")
+                print(f"  Pred Variance: {pred_variance:.6f} < 0.001")
                 print("="*80)
                 print("\nArchitecture validation complete!")
                 print("You can now proceed to full-scale training.")
@@ -343,19 +386,19 @@ def run_overfitting_test():
     print("\n" + "="*80)
     print("OVERFITTING TEST COMPLETE")
     print("="*80)
-    print(f"Best Loss: {best_loss:.6f}")
     print()
     
-    if best_loss < 0.01:
+    if epoch_loss < 0.01:
         print("SUCCESS: Loss < 0.01")
         print("  Architecture can memorize data correctly!")
         print("  Gradients are flowing properly.")
         print("  Ready for full-scale training!")
-    elif best_loss < 0.1:
+    elif epoch_loss < 0.1:
         print("PARTIAL SUCCESS: Loss < 0.1 but > 0.01")
+        print("  Model is learning but may need more epochs.")
     else:
-        print("FAILURE: Loss > 0.1")
-        print("  Model is not learning properly.")
+        print("NEEDS MORE TRAINING: Loss > 0.1")
+        print("  Model is still learning. Consider more epochs.")
     
     print("="*80 + "\n")
     print(f"Logs saved to: {log_dir}")

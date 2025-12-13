@@ -20,13 +20,24 @@ class MetaworldDataset(BaseDataset):
             max_train_episodes=None,
             ):
         super().__init__()
+
         self.replay_buffer = ReplayBuffer.copy_from_path(
-            zarr_path, keys=['state', 'action', 'point_cloud'])
+            zarr_path,
+            keys=[
+                'state',
+                'action',
+                'point_cloud',
+                'instruction',
+                'img'
+            ],
+        )
+
         val_mask = get_val_mask(
             n_episodes=self.replay_buffer.n_episodes, 
             val_ratio=val_ratio,
             seed=seed)
         train_mask = ~val_mask
+
         train_mask = downsample_mask(
             mask=train_mask, 
             max_n=max_train_episodes, 
@@ -37,7 +48,9 @@ class MetaworldDataset(BaseDataset):
             sequence_length=horizon,
             pad_before=pad_before, 
             pad_after=pad_after,
-            episode_mask=train_mask)
+            episode_mask=train_mask
+        )
+
         self.train_mask = train_mask
         self.horizon = horizon
         self.pad_before = pad_before
@@ -51,7 +64,7 @@ class MetaworldDataset(BaseDataset):
             pad_before=self.pad_before, 
             pad_after=self.pad_after,
             episode_mask=~self.train_mask
-            )
+        )
         val_set.train_mask = ~self.train_mask
         return val_set
 
@@ -69,21 +82,50 @@ class MetaworldDataset(BaseDataset):
         return len(self.sampler)
 
     def _sample_to_data(self, sample):
-        agent_pos = sample['state'][:,].astype(np.float32)
-        point_cloud = sample['point_cloud'][:,].astype(np.float32)
+        agent_pos = sample['state'].astype(np.float32)
+        point_cloud = sample['point_cloud'].astype(np.float32)
+
+        instruction = sample['instruction']
+        if isinstance(instruction, np.ndarray):
+            instruction = instruction.tolist()
+            instruction = [str(x) for x in instruction]
+
+        rgb_image = sample['img'].astype(np.uint8)
 
         data = {
             'obs': {
-                'point_cloud': point_cloud, 
-                'agent_pos': agent_pos, 
+                'point_cloud': point_cloud,
+                'agent_pos': agent_pos,
+                'instruction': instruction,
+                'rgb_image': rgb_image,  # <-- NEW
             },
             'action': sample['action'].astype(np.float32)
         }
+
         return data
+
+
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.sampler.sample_sequence(idx)
         data = self._sample_to_data(sample)
-        torch_data = dict_apply(data, torch.from_numpy)
+
+        torch_data = {}
+
+        for k, v in data.items():
+            if isinstance(v, dict):
+                torch_data[k] = {}
+                for kk, vv in v.items():
+                    if isinstance(vv, np.ndarray):
+                        torch_data[k][kk] = torch.from_numpy(vv)
+                    else:
+                        torch_data[k][kk] = vv
+            else:
+                if isinstance(v, np.ndarray):
+                    torch_data[k] = torch.from_numpy(v)
+                else:
+                    torch_data[k] = v
+
         return torch_data
+
 

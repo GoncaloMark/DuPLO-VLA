@@ -273,6 +273,7 @@ class DP3Encoder(nn.Module):
     def forward(self, observations: Dict) -> torch.Tensor:
         # Process point cloud
         points = observations[self.point_cloud_key]
+    
         assert len(points.shape) == 3, cprint(f"point cloud shape: {points.shape}, length should be 3", "red")
         if self.use_imagined_robot:
             img_points = observations[self.imagination_key][..., :points.shape[-1]]

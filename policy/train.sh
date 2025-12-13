@@ -25,7 +25,6 @@ echo "  Python: $(which python)"
 echo "  Version: $(python --version)"
 echo "============================================"
 
-cd "$(dirname "$0")"
 
 echo "Starting End-to-End VLA Training..."
 echo "Task: pick-place"

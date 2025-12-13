@@ -15,7 +15,7 @@ class LatentTaskEncoder(nn.Module):
             nn.Linear(vlm_hidden_dim, 256),
             nn.Tanh(),
             nn.Linear(256, 1)
-        )
+        ).to(torch.bfloat16)
 
         self.encoder = nn.Sequential(
             nn.Linear(vlm_hidden_dim, 1024),
@@ -24,7 +24,7 @@ class LatentTaskEncoder(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(1024, latent_dim),
             nn.LayerNorm(latent_dim)
-        )
+        ).to(torch.bfloat16)
 
     def attention_pooling(self, features: torch.Tensor) -> torch.Tensor:
         """Attention-based pooling over sequence dimension"""

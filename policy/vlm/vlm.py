@@ -23,7 +23,7 @@ class VisualTaskPlanner(nn.Module):
         )
         self.processor = Qwen3VLProcessor.from_pretrained(model_name)
 
-        vlm_hidden_dim = self.vlm.config.hidden_size
+        vlm_hidden_dim=self.vlm.config.text_config.hidden_size
         self.task_encoder = LatentTaskEncoder(vlm_hidden_dim, latent_dim)
 
         if freeze_vlm:
@@ -32,24 +32,39 @@ class VisualTaskPlanner(nn.Module):
 
     def extract_features(
         self,
-        images: Union[torch.Tensor, List[np.ndarray]],
-        text: str
+        images: Union[torch.Tensor, np.ndarray, List[np.ndarray]],
+        text: str,
+        training: bool
     ) -> torch.Tensor:
+
+        # Convert torch tensor to numpy if needed
         if isinstance(images, torch.Tensor):
-            images = images.permute(1,2,0).cpu().numpy()
+            images = images.cpu().numpy()
+
+        # Handle shape (H, C, W) -> (H, W, C)
         if isinstance(images, np.ndarray):
-            images = [images]
+            if images.ndim == 3 and images.shape[1] == 3:  # single image
+                images = np.transpose(images, (0, 2, 1))  # (H, C, W) -> (H, W, C)
+            elif images.ndim == 4 and images.shape[1] == 3:  # batch of images
+                images = np.transpose(images, (0, 2, 3, 1))  # (N, C, H, W) -> (N, H, W, C)
+            images = [images]  # put in list for processor
+
+        # Add image placeholder token to the text
+        # Qwen3-VL uses <|image_pad|> or <|vision_start|><|image_pad|>...<|vision_end|>
+        text_with_image = f"<|vision_start|><|image_pad|><|vision_end|>{text}"
 
         inputs = self.processor(
-            text=[text],
+            text=[text_with_image],  # Changed: include image tokens
             images=images,
             return_tensors="pt",
             padding=True
         ).to(self.vlm.device)
-
-        with torch.no_grad():
+        
+        if training:
             out = self.vlm(**inputs, output_hidden_states=True)
-
+        else:
+            with torch.no_grad():
+                out = self.vlm(**inputs, output_hidden_states=True)
         multimodal_hidden = out.hidden_states[-1]  # (1, seq_len, hidden_dim)
 
         return multimodal_hidden
@@ -72,7 +87,7 @@ class VisualTaskPlanner(nn.Module):
 
         return self.processor.batch_decode(ids, skip_special_tokens=True)[0]
 
-    def plan(self, image, instruction, get_text=False):
+    def plan(self, image, instruction, training=True, get_text=False):
         prompt = f"""You are controlling a robotic arm that needs to complete the following instruction: {instruction}
 Given the image and instruction, provide a detailed plan enriched with spatial cues and object descriptions with relative positions.
 
@@ -85,7 +100,7 @@ Principles:
 
 Plan:"""
 
-        hidden = self.extract_features(image, prompt)
+        hidden = self.extract_features(image, prompt, training)
         latent_task = self.task_encoder(hidden)
 
         plan_text = None
