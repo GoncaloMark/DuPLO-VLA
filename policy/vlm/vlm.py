@@ -77,9 +77,9 @@ class VisualTaskPlanner(nn.Module):
         context = torch.enable_grad() if training else torch.no_grad()
         with context:
             with autocast(device_type="cuda", dtype=torch.bfloat16):
-                out = self.vlm(**inputs)
+                out = self.vlm(**inputs, output_hidden_states=True)
 
-        return out.last_hidden_state
+        return out.hidden_states[-1]
 
     def generate_text(self, images, prompt, max_tokens=256):
         if isinstance(images, np.ndarray):
