@@ -212,7 +212,7 @@ def run_overfitting_test():
     print("Setting up optimizer...")
     param_groups = [
         {
-            'params': model.planner.vlm.parameters(),
+            'params': [p for p in model.planner.vlm.parameters() if p.requires_grad],
             'lr': vlm_lr,
             'name': 'vlm'
         },

@@ -91,7 +91,7 @@ class EndToEndRobotPolicy(nn.Module):
         # System 2
         self.planner = VisualTaskPlanner(
             model_name=vlm_model_name,
-            freeze_vlm=False,
+            freeze_vlm=True,
             latent_dim=latent_dim
         )
         
@@ -107,7 +107,7 @@ class EndToEndRobotPolicy(nn.Module):
             self.planner.vlm = get_peft_model(self.planner.vlm, lora_config)
             print(f"LoRA applied to VLM. Trainable params")
             
-
+        self.planner.vlm.print_trainable_parameters()
 
         noise_scheduler = DDIMScheduler(
             num_train_timesteps=num_train_timesteps,
@@ -185,24 +185,16 @@ class EndToEndRobotPolicy(nn.Module):
             actions: (B, T, A) ground truth actions
             compute_loss: Whether to compute loss
         """
-        batch_size = obs_dict['point_cloud'].shape[0]
         
         # System 2
-        task_latents = []
-        for i in range(batch_size):
-            if 'rgb_image' in obs_dict:
-                rgb_image = obs_dict['rgb_image'][i,0]
-            
-            latent, _ = self.planner.plan(
-                image=rgb_image,
-                instruction=instruction_text[i],
-                get_text=False
-            )
-            latent = latent.squeeze()
-            task_latents.append(latent)
-        
-        # Stack latents: (B, latent_dim)
-        task_latents = torch.stack(task_latents, dim=0)
+        rgb_images = obs_dict['rgb_image'][:, 0]
+
+        task_latents, _ = self.planner.plan(
+            image=rgb_images,
+            instruction=instruction_text,
+            training=self.training,
+            get_text=False
+        )
         
         # (B, T, latent_dim)
         T = obs_dict['point_cloud'].shape[1]

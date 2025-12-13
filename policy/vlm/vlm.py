@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
+from torch.amp import autocast
+
 
 from vlm.latent_encoder import LatentTaskEncoder
 
@@ -30,44 +32,36 @@ class VisualTaskPlanner(nn.Module):
             for p in self.vlm.parameters():
                 p.requires_grad = False
 
-    def extract_features(
+    def extract_features_batch(
         self,
-        images: Union[torch.Tensor, np.ndarray, List[np.ndarray]],
-        text: str,
+        images: torch.Tensor,
+        texts: List[str],
         training: bool
     ) -> torch.Tensor:
+        """
+        images: (B, H, W, C)
+        texts:  list[str] length B
+        returns: (B, seq_len, hidden_dim)
+        """
 
-        # Convert torch tensor to numpy if needed
-        if isinstance(images, torch.Tensor):
-            images = images.cpu().numpy()
-
-        # Handle shape (H, C, W) -> (H, W, C)
-        if isinstance(images, np.ndarray):
-            if images.ndim == 3 and images.shape[1] == 3:  # single image
-                images = np.transpose(images, (0, 2, 1))  # (H, C, W) -> (H, W, C)
-            elif images.ndim == 4 and images.shape[1] == 3:  # batch of images
-                images = np.transpose(images, (0, 2, 3, 1))  # (N, C, H, W) -> (N, H, W, C)
-            images = [images]  # put in list for processor
-
-        # Add image placeholder token to the text
-        # Qwen3-VL uses <|image_pad|> or <|vision_start|><|image_pad|>...<|vision_end|>
-        text_with_image = f"<|vision_start|><|image_pad|><|vision_end|>{text}"
+        text_with_image = [
+            f"<|vision_start|><|image_pad|><|vision_end|>{t}"
+            for t in texts
+        ]
 
         inputs = self.processor(
-            text=[text_with_image],  # Changed: include image tokens
+            text=text_with_image,
             images=images,
             return_tensors="pt",
             padding=True
         ).to(self.vlm.device)
-        
-        if training:
-            out = self.vlm(**inputs, output_hidden_states=True)
-        else:
-            with torch.no_grad():
-                out = self.vlm(**inputs, output_hidden_states=True)
-        multimodal_hidden = out.hidden_states[-1]  # (1, seq_len, hidden_dim)
 
-        return multimodal_hidden
+        context = torch.enable_grad() if training else torch.no_grad()
+        with context:
+            with autocast(dtype=torch.bfloat16):
+                out = self.vlm(**inputs)
+
+        return out.last_hidden_state
 
     def generate_text(self, images, prompt, max_tokens=256):
         if isinstance(images, np.ndarray):
@@ -87,24 +81,64 @@ class VisualTaskPlanner(nn.Module):
 
         return self.processor.batch_decode(ids, skip_special_tokens=True)[0]
 
-    def plan(self, image, instruction, training=True, get_text=False):
-        prompt = f"""You are controlling a robotic arm that needs to complete the following instruction: {instruction}
-Given the image and instruction, provide a detailed plan enriched with spatial cues and object descriptions with relative positions.
+    def plan(
+        self,
+        image: Union[torch.Tensor, np.ndarray],
+        instruction: Union[str, List[str]],
+        training: bool = True,
+        get_text: bool = False
+    ):
+        """
+        image:
+            - single: (H, W, C)
+            - batch:  (B, H, W, C)
 
-Use common sense to identify objects (cups, bottles, fruits, boxes, tools, etc.).
+        instruction:
+            - single: str
+            - batch:  List[str] length B
+        """
 
-Principles:
-- Avoid blocked or surrounded objects
-- Avoid objects that would cause others to topple
-- Select objects matching the user prompt
+        is_batched = isinstance(instruction, list)
 
-Plan:"""
+        if not is_batched:
+            images = image.unsqueeze(0) if torch.is_tensor(image) else np.expand_dims(image, 0)
+            instructions = [instruction]
+        else:
+            images = image
+            instructions = instruction
 
-        hidden = self.extract_features(image, prompt, training)
+        prompts = [
+            f"""You are controlling a robotic arm that needs to complete the following instruction: {instr}
+    Given the image and instruction, provide a detailed plan enriched with spatial cues and object descriptions with relative positions.
+
+    Use common sense to identify objects (cups, bottles, fruits, boxes, tools, etc.).
+
+    Principles:
+    - Avoid blocked or surrounded objects
+    - Avoid objects that would cause others to topple
+    - Select objects matching the user prompt
+
+    Plan:"""
+            for instr in instructions
+        ]
+
+        hidden = self.extract_features_batch(images, prompts, training)
+        # hidden: (B, seq_len, hidden_dim)
+
         latent_task = self.task_encoder(hidden)
+        # latent_task: (B, latent_dim)
 
         plan_text = None
         if get_text:
-            plan_text = self.generate_text(image, prompt)
+            plan_text = [
+                self.generate_text(images[i], prompts[i])
+                for i in range(len(prompts))
+            ]
+
+        if not is_batched:
+            latent_task = latent_task[0]
+            if plan_text is not None:
+                plan_text = plan_text[0]
 
         return latent_task, plan_text
+
