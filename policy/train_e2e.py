@@ -507,19 +507,6 @@ class EndToEndTrainer:
         
         return {'train_action_mse_error': mse.item()}
     
-    @torch.no_grad()
-    def run_rollout(self):
-        """Run policy rollout in environment"""
-        if self.env_runner is None:
-            return {}
-        
-        policy = self.ema_model if self.use_ema else self.model
-        policy.eval()
-        
-        runner_log = self.env_runner.run(policy)
-        
-        return runner_log
-    
     def save_checkpoint(self, tag='latest', is_best=False):
         """Save checkpoint with separate deployment weights"""
         # Full checkpoint for resuming training
