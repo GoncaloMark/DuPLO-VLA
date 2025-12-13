@@ -76,7 +76,7 @@ class VisualTaskPlanner(nn.Module):
 
         context = torch.enable_grad() if training else torch.no_grad()
         with context:
-            with autocast(dtype=torch.bfloat16):
+            with autocast(device_type="cuda", dtype=torch.bfloat16):
                 out = self.vlm(**inputs)
 
         return out.last_hidden_state
