@@ -50,7 +50,7 @@ def run_overfitting_test():
     
     # TINY DATASET
     max_train_episodes = 5  
-    batch_size = 32  
+    batch_size = 16
     num_workers = 2
     horizon = 16
     pad_before = 1
