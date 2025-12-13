@@ -45,13 +45,22 @@ class VisualTaskPlanner(nn.Module):
         """
 
         if isinstance(images, torch.Tensor): 
-            images = images.cpu().numpy() # Handle shape (H, C, W) -> (H, W, C) 
+            images = images.cpu().numpy()
+        
+        # Handle shape (H, C, W) -> (H, W, C) 
         if isinstance(images, np.ndarray): 
             if images.ndim == 3 and images.shape[1] == 3: # single image 
-                images = np.transpose(images, (0, 2, 1)) 
+                images = np.transpose(images, (0, 2, 1))
+                images = [images]  # Single image → list of 1
             elif images.ndim == 4 and images.shape[1] == 3: # batch of images 
-                images = np.transpose(images, (0, 2, 3, 1)) 
-            images = [images] 
+                images = np.transpose(images, (0, 2, 3, 1))  # (B, C, H, W) → (B, H, W, C)
+                images = [images[i] for i in range(len(images))]  
+            else:
+                if images.ndim == 3:
+                    images = [images]
+                else:
+                    images = [images[i] for i in range(len(images))]
+
 
         text_with_image = [
             f"<|vision_start|><|image_pad|><|vision_end|>{t}"
