@@ -14,8 +14,6 @@ from torch.utils.data import DataLoader
 from pathlib import Path
 from tqdm import tqdm
 import copy
-import numpy as np
-from peft import LoraConfig, get_peft_model
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
 from vlm.vlm import VisualTaskPlanner
@@ -80,11 +78,6 @@ class EndToEndRobotPolicy(nn.Module):
         beta_start=0.0001,
         beta_end=0.02,
         beta_schedule="squaredcos_cap_v2",
-        # LoRA parameters
-        use_lora=True,
-        lora_r=8,
-        lora_alpha=16,
-        lora_dropout=0.05,
     ):
         super().__init__()
         
@@ -94,19 +87,7 @@ class EndToEndRobotPolicy(nn.Module):
             freeze_vlm=True,
             latent_dim=latent_dim
         )
-        
-        if use_lora:
-            lora_config = LoraConfig(
-                r=lora_r,
-                lora_alpha=lora_alpha,
-                lora_dropout=lora_dropout,
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-                bias="none",
-                task_type="CAUSAL_LM"
-            )
-            self.planner.vlm = get_peft_model(self.planner.vlm, lora_config)
-            print(f"LoRA applied to VLM. Trainable params")
-            
+
         self.planner.vlm.print_trainable_parameters()
 
         noise_scheduler = DDIMScheduler(
@@ -128,7 +109,6 @@ class EndToEndRobotPolicy(nn.Module):
         }
         
         self.shape_meta = prepare_meta(self.shape_meta)
-        print(self.shape_meta)
 
         # System 1
         self.policy = DP3(
@@ -158,14 +138,14 @@ class EndToEndRobotPolicy(nn.Module):
         self.latent_dim = latent_dim
         self.n_obs_steps = n_obs_steps
 
-    def to(self, device):
-        """Override to() to ensure all submodules move correctly"""
-        super().to(device)
-        # Explicitly move the policy and planner
-        self.policy = self.policy.to(device)
-        self.planner.vlm = self.planner.vlm.to(device)
-        self.planner.task_encoder = self.planner.task_encoder.to(device)
-        return self
+    @staticmethod
+    def scale_grad(x, scale):
+        y = x
+        if x.requires_grad:
+            def hook(grad):
+                return grad * scale
+            y.register_hook(hook)
+        return y
 
     def forward(
         self,
@@ -189,12 +169,17 @@ class EndToEndRobotPolicy(nn.Module):
         # System 2
         rgb_images = obs_dict['rgb_image'][:, 0]
 
-        task_latents, _ = self.planner.plan(
+        task_latents, _, reconstructed, pooled = self.planner.plan(
             image=rgb_images,
             instruction=instruction_text,
             training=self.training,
             get_text=False
         )
+
+        if self.training:
+            task_latents = self.scale_grad(task_latents, scale=0.1)
+
+        task_latents = task_latents.to(dtype=torch.float32)
         
         # (B, T, latent_dim)
         T = obs_dict['point_cloud'].shape[1]
@@ -203,12 +188,12 @@ class EndToEndRobotPolicy(nn.Module):
         device = next(self.policy.parameters()).device
     
         obs_dict_with_task = {
-           k: v.to(device) if isinstance(v, torch.Tensor) else v
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
             for k, v in obs_dict.items()
             if k not in ['instruction', 'rgb_image']
         } 
         obs_dict_with_task['task_latent'] = task_latents_expanded.to(device) 
-         
+
         # System 1
         if compute_loss and actions is not None:
             batch = {
@@ -216,8 +201,19 @@ class EndToEndRobotPolicy(nn.Module):
                 'action': actions.to(device)
             }
 
-            loss, loss_dict = self.policy.compute_loss(batch)
-            return loss, loss_dict
+            diff_loss, loss_dict = self.policy.compute_loss(batch)
+
+            target = pooled.detach()
+            
+            distill_loss = torch.nn.functional.mse_loss(reconstructed, target)
+            
+            distill_weight = 1.0 
+            total_loss = diff_loss + (distill_weight * distill_loss)
+            
+            loss_dict['diffusion_loss'] = diff_loss.item()
+            loss_dict['vlm_distill_loss'] = distill_loss.item()
+
+            return total_loss, loss_dict
         else:
             # Inference mode
             result = self.policy.predict_action(obs_dict_with_task)
@@ -229,14 +225,12 @@ class EndToEndTrainer:
         model: EndToEndRobotPolicy,
         train_dataset: MetaworldDataset,
         val_dataset: MetaworldDataset,
-        env_runner = None,
         # Learning rates
-        vlm_lr=5e-5,
         latent_lr=1e-4,
         policy_lr=1e-4,
         weight_decay=1e-6,
         # Training config
-        batch_size=128,
+        batch_size=64,
         num_workers=8,
         gradient_accumulate_every=1,
         # EMA config
@@ -253,7 +247,6 @@ class EndToEndTrainer:
         # Logging and checkpointing
         log_dir="./logs/e2e_training",
         checkpoint_every=200,
-        rollout_every=200,
         val_every=1,
         sample_every=5,
         device="cuda:0",
@@ -288,14 +281,13 @@ class EndToEndTrainer:
         # normalizer
         normalizer = train_dataset.get_normalizer()
         normalizer.params_dict['task_latent'] = nn.ParameterDict({
-            'mean': torch.zeros(latent_dim),
-            'std': torch.ones(latent_dim)
+            'mean': torch.zeros(self.model.latent_dim),
+            'std': torch.ones(self.model.latent_dim)
         })
 
         self.model.policy.set_normalizer(normalizer)
         
         self.optimizer = self._setup_optimizer(
-            vlm_lr=vlm_lr,
             latent_lr=latent_lr,
             policy_lr=policy_lr,
             weight_decay=weight_decay
@@ -311,9 +303,15 @@ class EndToEndTrainer:
         self.ema_model = None
         self.ema = None
         if use_ema:
+            shared_vlm = self.model.planner.vlm
+            self.model.planner.vlm = None
+
             self.ema_model = copy.deepcopy(self.model)
             self.ema_model.to(device)
             self.ema_model.policy.set_normalizer(normalizer)
+
+            self.model.planner.vlm = shared_vlm
+            self.ema_model.planner.vlm = shared_vlm
             
             self.ema = EMAModel(
                 model=self.ema_model,
@@ -323,8 +321,6 @@ class EndToEndTrainer:
                 min_value=ema_min_value,
                 max_value=ema_max_value
             )
-        
-        self.env_runner = env_runner
         
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(exist_ok=True, parents=True)
@@ -337,20 +333,14 @@ class EndToEndTrainer:
         self.best_test_score = float('-inf')
         
         self.checkpoint_every = checkpoint_every
-        self.rollout_every = rollout_every
         self.val_every = val_every
         self.sample_every = sample_every
         
         self.train_sampling_batch = None
         
-    def _setup_optimizer(self, vlm_lr, latent_lr, policy_lr, weight_decay):
+    def _setup_optimizer(self, latent_lr, policy_lr, weight_decay):
         """Setup optimizer with different learning rates for different components"""
         param_groups = [
-            {
-                'params': self.model.planner.vlm.parameters(),
-                'lr': vlm_lr,
-                'name': 'vlm'
-            },
             {
                 'params': self.model.planner.task_encoder.parameters(),
                 'lr': latent_lr,
@@ -396,10 +386,14 @@ class EndToEndTrainer:
         
         for batch_idx, batch in enumerate(pbar):
             # Move batch 
-            obs_dict = {k: v.to(self.device, non_blocking=True) 
-                       for k, v in batch['obs'].items()}
+            obs_dict = {}
+            for k, v in batch['obs'].items():
+                if isinstance(v, torch.Tensor):
+                    obs_dict[k] = v.to(self.device)
+                else:
+                    obs_dict[k] = v
             actions = batch['action'].to(self.device, non_blocking=True)
-            instructions = batch['instruction']  # List of strings
+            instructions = batch['obs']['instruction']
             
             if self.train_sampling_batch is None:
                 self.train_sampling_batch = {
@@ -459,10 +453,14 @@ class EndToEndTrainer:
         val_metrics = {}
         
         for batch in tqdm(self.val_loader, desc="Validating"):
-            obs_dict = {k: v.to(self.device, non_blocking=True) 
-                       for k, v in batch['obs'].items()}
+            obs_dict = {}
+            for k, v in batch['obs'].items():
+                if isinstance(v, torch.Tensor):
+                    obs_dict[k] = v.to(self.device)
+                else:
+                    obs_dict[k] = v
             actions = batch['action'].to(self.device, non_blocking=True)
-            instructions = batch['instruction']
+            instructions = batch['obs']['instruction']
             
             loss, loss_dict = policy(
                 obs_dict=obs_dict,
@@ -490,10 +488,15 @@ class EndToEndTrainer:
         policy.eval()
         
         batch = self.train_sampling_batch
-        obs_dict = {k: v.to(self.device, non_blocking=True) 
-                   for k, v in batch['obs'].items()}
+        obs_dict = {}
+        for k, v in batch['obs'].items():
+            if isinstance(v, torch.Tensor):
+                obs_dict[k] = v.to(self.device)
+            else:
+                obs_dict[k] = v
         gt_action = batch['action'].to(self.device, non_blocking=True)
-        instructions = batch['instruction']
+        instructions = batch['obs']['instruction']
+
         
         result = policy(
             obs_dict=obs_dict,
@@ -507,99 +510,114 @@ class EndToEndTrainer:
         
         return {'train_action_mse_error': mse.item()}
     
-    def save_checkpoint(self, tag='latest', is_best=False):
-        """Save checkpoint with separate deployment weights"""
-        # Full checkpoint for resuming training
-        checkpoint = {
-            'epoch': self.epoch,
-            'global_step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'lr_scheduler_state_dict': self.lr_scheduler.state_dict(),
-            'best_val_loss': self.best_val_loss,
-            'best_test_score': self.best_test_score,
-        }
-        
-        if self.use_ema:
-            checkpoint['ema_model_state_dict'] = self.ema_model.state_dict()
-        
-        checkpoint_path = self.checkpoint_dir / f'{tag}.ckpt'
-        torch.save(checkpoint, checkpoint_path)
-        
-        deploy_dir = self.log_dir / 'deployment'
-        deploy_dir.mkdir(exist_ok=True)
-        
+    def save_checkpoint(self, tag="latest", is_best=False):
+        """Save checkpoint WITHOUT VLM weights"""
+
         deploy_model = self.ema_model if self.use_ema else self.model
-        
-        planner_state = deploy_model.planner.state_dict()
-        planner_path = deploy_dir / f'system2_planner_{tag}.pth'
-        torch.save({
-            'state_dict': planner_state,
-            'latent_dim': deploy_model.latent_dim,
-            'model_name': 'VLM Planner (System 2)',
-            'epoch': self.epoch,
-            'global_step': self.global_step,
-        }, planner_path)
-        
-        policy_state = deploy_model.policy.state_dict()
-        policy_path = deploy_dir / f'system1_policy_{tag}.pth'
-        torch.save({
-            'state_dict': policy_state,
-            'normalizer': deploy_model.policy.normalizer.state_dict() if hasattr(deploy_model.policy, 'normalizer') else None,
-            'model_name': 'DP3 Policy (System 1)',
-            'epoch': self.epoch,
-            'global_step': self.global_step,
-        }, policy_path)
-        
-        # configuration for reconstruction
-        config_path = deploy_dir / f'config_{tag}.pth'
-        torch.save({
-            'shape_meta': deploy_model.shape_meta,
-            'latent_dim': deploy_model.latent_dim,
-            'n_obs_steps': deploy_model.n_obs_steps,
-            'epoch': self.epoch,
-            'global_step': self.global_step,
-        }, config_path)
-        
+
+        checkpoint = {
+            "epoch": self.epoch,
+            "global_step": self.global_step,
+
+            "task_encoder_state_dict": deploy_model.planner.task_encoder.state_dict(),
+            "policy_state_dict": deploy_model.policy.state_dict(),
+
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "lr_scheduler_state_dict": self.lr_scheduler.state_dict(),
+
+            "best_val_loss": self.best_val_loss,
+            "best_test_score": self.best_test_score,
+        }
+
+        checkpoint_path = self.checkpoint_dir / f"{tag}.ckpt"
+        torch.save(checkpoint, checkpoint_path)
+
+        deploy_dir = self.log_dir / "deployment"
+        deploy_dir.mkdir(exist_ok=True)
+
+        planner_path = deploy_dir / f"system2_latent_encoder_{tag}.pth"
+        torch.save(
+            {
+                "state_dict": deploy_model.planner.task_encoder.state_dict(),
+                "latent_dim": deploy_model.latent_dim,
+                "model_name": "LatentTaskEncoder",
+                "epoch": self.epoch,
+                "global_step": self.global_step,
+            },
+            planner_path,
+        )
+
+        policy_path = deploy_dir / f"system1_policy_{tag}.pth"
+        torch.save(
+            {
+                "state_dict": deploy_model.policy.state_dict(),
+                "normalizer": (
+                    deploy_model.policy.normalizer.state_dict()
+                    if hasattr(deploy_model.policy, "normalizer")
+                    else None
+                ),
+                "model_name": "DP3 Policy",
+                "epoch": self.epoch,
+                "global_step": self.global_step,
+            },
+            policy_path,
+        )
+
+        config_path = deploy_dir / f"config_{tag}.pth"
+        torch.save(
+            {
+                "latent_dim": deploy_model.latent_dim,
+                "n_obs_steps": deploy_model.n_obs_steps,
+                "epoch": self.epoch,
+                "global_step": self.global_step,
+            },
+            config_path,
+        )
+
         if is_best:
-            best_checkpoint_path = self.checkpoint_dir / 'best.ckpt'
+            best_checkpoint_path = self.checkpoint_dir / "best.ckpt"
             torch.save(checkpoint, best_checkpoint_path)
-            
-            torch.save(torch.load(planner_path), deploy_dir / 'system2_planner_best.pth')
-            torch.save(torch.load(policy_path), deploy_dir / 'system1_policy_best.pth')
-            torch.save(torch.load(config_path), deploy_dir / 'config_best.pth')
-            
-            print(f"\n{'='*80}")
-            print(f"Saved best checkpoint!")
-            print(f"  Full checkpoint: {best_checkpoint_path}")
-            print(f"  System 2 (HPC): {deploy_dir / 'system2_planner_best.pth'}")
-            print(f"  System 1 (Robot): {deploy_dir / 'system1_policy_best.pth'}")
-            print(f"  Config: {deploy_dir / 'config_best.pth'}")
-            print(f"{'='*80}\n")
-        
+
+            torch.save(torch.load(planner_path), deploy_dir / "system2_latent_encoder_best.pth")
+            torch.save(torch.load(policy_path), deploy_dir / "system1_policy_best.pth")
+            torch.save(torch.load(config_path), deploy_dir / "config_best.pth")
+
+            print("\n" + "=" * 80)
+            print("Saved best checkpoint (NO VLM WEIGHTS)")
+            print(f"  Checkpoint: {best_checkpoint_path}")
+            print(f"  Latent encoder: {deploy_dir / 'system2_latent_encoder_best.pth'}")
+            print(f"  DP3 policy: {deploy_dir / 'system1_policy_best.pth'}")
+            print("=" * 80 + "\n")
+
         return str(checkpoint_path)
-    
+
     def load_checkpoint(self, path):
-        """Load checkpoint"""
+        """Load checkpoint WITHOUT touching the VLM"""
+
         checkpoint = torch.load(path, map_location=self.device)
-        
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
-        self.epoch = checkpoint['epoch']
-        self.global_step = checkpoint['global_step']
-        self.best_val_loss = checkpoint['best_val_loss']
-        self.best_test_score = checkpoint.get('best_test_score', float('-inf'))
-        
-        if self.use_ema and 'ema_model_state_dict' in checkpoint:
-            self.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
-        
+
+        self.model.planner.task_encoder.load_state_dict(
+            checkpoint["task_encoder_state_dict"]
+        )
+        self.model.policy.load_state_dict(
+            checkpoint["policy_state_dict"]
+        )
+
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
+
+        self.epoch = checkpoint["epoch"]
+        self.global_step = checkpoint["global_step"]
+        self.best_val_loss = checkpoint["best_val_loss"]
+        self.best_test_score = checkpoint.get("best_test_score", float("-inf"))
+
         print(f"Loaded checkpoint from {path}")
         print(f"  Epoch: {self.epoch}")
         print(f"  Global step: {self.global_step}")
-        
+        print("  VLM weights were NOT loaded (frozen & external)")
+
         return self.epoch
-    
+
     def train(self, resume_from=None):
         """Main training loop"""
         start_epoch = 0
@@ -646,19 +664,6 @@ class EndToEndTrainer:
                 step_log.update(sample_metrics)
                 print(f"Epoch {epoch} - Action MSE: {sample_metrics['train_action_mse_error']:.4f}")
             
-            # Rollout
-            if (epoch % self.rollout_every) == 0 and self.env_runner is not None:
-                print(f"\nRunning rollout...")
-                rollout_metrics = self.run_rollout()
-                step_log.update(rollout_metrics)
-                
-                if 'test_mean_score' in rollout_metrics:
-                    test_score = rollout_metrics['test_mean_score']
-                    print(f"Epoch {epoch} - Test Score: {test_score:.4f}")
-                    
-                    if test_score > self.best_test_score:
-                        self.best_test_score = test_score
-            
             if (epoch % self.checkpoint_every) == 0:
                 is_best = False
                 if 'test_mean_score' in step_log:
@@ -673,19 +678,22 @@ class EndToEndTrainer:
         print("="*80)
 
 def main():
-    task_name = "pick-place"
     device = "cuda:0"
     
     # Shape meta
     shape_meta = {
         'obs': {
             'point_cloud': {
-                'shape': [512, 3],
+                'shape': [1024, 6],
                 'type': 'point_cloud'
             },
             'agent_pos': {
                 'shape': [9],
                 'type': 'low_dim'
+            },
+            'rgb_image': {
+                'shape': [128, 128, 3],
+                'type': 'rgb'
             }
         },
         'action': {
@@ -694,7 +702,7 @@ def main():
     }
     
     train_dataset = MetaworldDataset(
-        zarr_path=f'data/metaworld_{task_name}_expert.zarr',
+        zarr_path=f'data/metaworld_all_tasks_expert_augmented.zarr',
         horizon=16,
         pad_before=1,  # n_obs_steps - 1
         pad_after=7,   # n_action_steps - 1
@@ -733,7 +741,7 @@ def main():
         beta_end=0.02,
         beta_schedule="squaredcos_cap_v2",
         # LoRA config
-        use_lora=True,
+        use_lora=False,
         lora_r=8,
         lora_alpha=16,
         lora_dropout=0.05,
@@ -765,9 +773,8 @@ def main():
         lr_warmup_steps=500,
         num_epochs=3000,
         # Logging
-        log_dir=f'./logs/e2e_{task_name}',
+        log_dir=f'./logs/e2e_vla',
         checkpoint_every=200,
-        rollout_every=200,
         val_every=1,
         sample_every=5,
         device=device,

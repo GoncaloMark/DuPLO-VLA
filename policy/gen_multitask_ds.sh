@@ -8,7 +8,7 @@ TASKS=(
     "reach"
 )
 
-NUM_EPISODES=90  # Per task
+NUM_EPISODES=100  # Per task
 ROOT_DIR="data/"
 
 echo "=================================="
@@ -24,7 +24,7 @@ do
     echo "Generating data for: $TASK"
     echo "----------------------------------"
     
-    python scripts/generate_dataset.py \
+    python gen_demonstration_expert.py \
         --env_name $TASK \
         --num_episodes $NUM_EPISODES \
         --root_dir $ROOT_DIR

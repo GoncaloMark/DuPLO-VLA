@@ -26,6 +26,12 @@ class LatentTaskEncoder(nn.Module):
             nn.LayerNorm(latent_dim)
         ).to(torch.bfloat16)
 
+        self.reconstruction_head = nn.Sequential(
+            nn.Linear(latent_dim, 1024),
+            nn.GELU(),
+            nn.Linear(1024, vlm_hidden_dim) 
+        ).to(torch.bfloat16)
+
     def attention_pooling(self, features: torch.Tensor) -> torch.Tensor:
         """Attention-based pooling over sequence dimension"""
         # features: (batch, seq_len, hidden_dim)
@@ -38,7 +44,8 @@ class LatentTaskEncoder(nn.Module):
         self,
         vlm_features: torch.Tensor,
     ) -> torch.Tensor:
-        pooled = self.attention_pooling(vlm_features)
-        latent = self.encoder(pooled)
+        pooled_features = self.attention_pooling(vlm_features)
+        latent = self.encoder(pooled_features)
+        reconstructed_features = self.reconstruction_head(latent)
         
-        return latent
+        return latent, reconstructed_features, pooled_features

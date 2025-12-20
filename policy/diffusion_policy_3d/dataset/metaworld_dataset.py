@@ -107,8 +107,6 @@ class MetaworldDataset(BaseDataset):
 
         return data
 
-
-    
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.sampler.sample_sequence(idx)
         data = self._sample_to_data(sample)

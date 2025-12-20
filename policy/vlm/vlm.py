@@ -74,8 +74,7 @@ class VisualTaskPlanner(nn.Module):
             padding=True
         ).to(self.vlm.device)
 
-        context = torch.enable_grad() if training else torch.no_grad()
-        with context:
+        with torch.no_grad():
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 out = self.vlm(**inputs, output_hidden_states=True)
 
@@ -143,7 +142,7 @@ class VisualTaskPlanner(nn.Module):
         hidden = self.extract_features_batch(images, prompts, training)
         # hidden: (B, seq_len, hidden_dim)
 
-        latent_task = self.task_encoder(hidden)
+        latent_task, reconstructed_features, pooled_features = self.task_encoder(hidden)
         # latent_task: (B, latent_dim)
 
         plan_text = None
@@ -155,8 +154,10 @@ class VisualTaskPlanner(nn.Module):
 
         if not is_batched:
             latent_task = latent_task[0]
+            reconstructed_features = reconstructed_features[0]
+            pooled_features = pooled_features[0]
             if plan_text is not None:
                 plan_text = plan_text[0]
 
-        return latent_task, plan_text
+        return latent_task, plan_text, reconstructed_features, pooled_features
 
