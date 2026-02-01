@@ -8,7 +8,7 @@
 #SBATCH --partition=gpu                   
 #SBATCH --mem-per-cpu=2G
 
-source venv/bin/activate
+source /data/home/g.marques/storage/DuPLO-VLA/venv/bin/activate
 
 echo "============================================"
 echo "SLURM Job Information"
