@@ -18,6 +18,8 @@ class MetaworldDataset(BaseDataset):
             seed=42,
             val_ratio=0.0,
             max_train_episodes=None,
+            latent_update_interval=3,  # Update every N timesteps 
+            randomize_update_interval=True,
             ):
         super().__init__()
 
@@ -56,6 +58,10 @@ class MetaworldDataset(BaseDataset):
         self.pad_before = pad_before
         self.pad_after = pad_after
 
+        self.latent_update_interval = latent_update_interval
+        self.randomize_update_interval = randomize_update_interval
+        self.rng = np.random.RandomState(seed)
+
     def get_validation_dataset(self):
         val_set = copy.copy(self)
         val_set.sampler = SequenceSampler(
@@ -66,6 +72,8 @@ class MetaworldDataset(BaseDataset):
             episode_mask=~self.train_mask
         )
         val_set.train_mask = ~self.train_mask
+        val_set.randomize_update_interval = False
+
         return val_set
 
     def get_normalizer(self, mode='limits', **kwargs):
@@ -106,10 +114,38 @@ class MetaworldDataset(BaseDataset):
         }
 
         return data
+    
+    def _create_latent_update_schedule(self, horizon):
+        """
+        Create a schedule indicating which timesteps should trigger VLM updates.
+        
+        Returns:
+            latent_update_mask: (horizon,) bool array, True = compute new latent
+            latent_group_id: (horizon,) int array, which latent group each timestep belongs to
+        """
+        # Determine update interval for this sample
+        if self.randomize_update_interval:
+            # Randomize between interval-1 and interval+1 for robustness
+            min_interval = max(1, self.latent_update_interval - 1)
+            max_interval = self.latent_update_interval + 1
+            interval = self.rng.randint(min_interval, max_interval + 1)
+        else:
+            interval = self.latent_update_interval
+        
+        # Create update mask: True at indices [0, interval, 2*interval, ...]
+        latent_update_mask = np.zeros(horizon, dtype=bool)
+        latent_update_mask[::interval] = True
+        
+        # Create group IDs: which latent each timestep should use
+        latent_group_id = np.arange(horizon) // interval
+        
+        return latent_update_mask, latent_group_id
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.sampler.sample_sequence(idx)
         data = self._sample_to_data(sample)
+
+        latent_update_mask, latent_group_id = self._create_latent_update_schedule(self.horizon)
 
         torch_data = {}
 
@@ -126,6 +162,9 @@ class MetaworldDataset(BaseDataset):
                     torch_data[k] = torch.from_numpy(v)
                 else:
                     torch_data[k] = v
+
+        torch_data['latent_update_mask'] = torch.from_numpy(latent_update_mask)
+        torch_data['latent_group_id'] = torch.from_numpy(latent_group_id)
 
         return torch_data
 

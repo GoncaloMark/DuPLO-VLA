@@ -2,4 +2,4 @@ pip3 install torch torchvision torchaudio --index-url https://download.pytorch.o
 
 cd policy && pip install -e . && cd ..
 
-pip install zarr wandb ipdb gpustat dm_control omegaconf hydra-core dill einops diffusers numba moviepy imageio av matplotlib termcolor transformers peft
+pip install zarr wandb ipdb gpustat dm_control omegaconf hydra-core dill einops diffusers numba moviepy imageio av matplotlib termcolor transformers

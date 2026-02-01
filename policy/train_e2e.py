@@ -1,3 +1,14 @@
+import signal
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from pathlib import Path
+from tqdm import tqdm
+import copy
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+
 if __name__ == "__main__":
     import sys
     import os
@@ -7,15 +18,7 @@ if __name__ == "__main__":
     sys.path.append(ROOT_DIR)
     os.chdir(ROOT_DIR)
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from pathlib import Path
-from tqdm import tqdm
-import copy
-from diffusers.schedulers.scheduling_ddim import DDIMScheduler
-
+from policy.vlm.latent_encoder import TemporalConsistencyLoss
 from vlm.vlm import VisualTaskPlanner
 from diffusion_policy_3d.policy.dp3 import DP3
 from diffusion_policy_3d.model.diffusion.ema_model import EMAModel
@@ -138,6 +141,8 @@ class EndToEndRobotPolicy(nn.Module):
         self.latent_dim = latent_dim
         self.n_obs_steps = n_obs_steps
 
+        self.temporal_consistency_loss = TemporalConsistencyLoss(weight=0.1)
+
     @staticmethod
     def scale_grad(x, scale):
         y = x
@@ -152,49 +157,102 @@ class EndToEndRobotPolicy(nn.Module):
         obs_dict,
         instruction_text,
         actions=None,
-        compute_loss=True
+        compute_loss=True,
+        dp3_grad_scale=1.0,
+        latent_update_mask=None,  # (B, T) or (T,)
+        latent_group_id=None
     ):
-        """
-        Forward pass combining VLM planning with DP3 policy
-        
-        Args:
-            obs_dict: Dictionary with observations
-                - 'point_cloud': (B, T, N, 3) point clouds
-                - 'agent_pos': (B, T, D) proprioceptive state
-            instruction_text: List[str] of length B with natural language instructions
-            actions: (B, T, A) ground truth actions
-            compute_loss: Whether to compute loss
-        """
-        
-        # System 2
-        rgb_images = obs_dict['rgb_image'][:, 0]
-
-        task_latents, _, reconstructed, pooled = self.planner.plan(
-            image=rgb_images,
-            instruction=instruction_text,
-            training=self.training,
-            get_text=False
-        )
-
-        if self.training:
-            task_latents = self.scale_grad(task_latents, scale=0.1)
-
-        task_latents = task_latents.to(dtype=torch.float32)
-        
-        # (B, T, latent_dim)
+        B = obs_dict['point_cloud'].shape[0]
         T = obs_dict['point_cloud'].shape[1]
-        task_latents_expanded = task_latents.unsqueeze(1).expand(-1, T, -1)
         
-        device = next(self.policy.parameters()).device
-    
+        # Handle default masks if not provided
+        if latent_update_mask is None:
+            # Default: update every 3 timesteps
+            latent_update_mask = torch.zeros(T, dtype=torch.bool, device=next(self.parameters()).device)
+            latent_update_mask[::3] = True
+            latent_group_id = torch.arange(T, device=latent_update_mask.device) // 3
+        
+        # Ensure masks are on correct device
+        device = next(self.parameters()).device
+        if isinstance(latent_update_mask, torch.Tensor):
+            latent_update_mask = latent_update_mask.to(device)
+        if isinstance(latent_group_id, torch.Tensor):
+            latent_group_id = latent_group_id.to(device)
+        
+        # Handle batched vs unbatched masks
+        if latent_update_mask.ndim == 1:
+            # (T,) -> (B, T)
+            latent_update_mask = latent_update_mask.unsqueeze(0).expand(B, -1)
+        if latent_group_id.ndim == 1:
+            # (T,) -> (B, T)
+            latent_group_id = latent_group_id.unsqueeze(0).expand(B, -1)
+        
+        # System 2: Compute latents only for update timesteps
+        # Collect unique update timesteps across batch
+        update_timesteps = latent_update_mask[0].nonzero(as_tuple=True)[0]  # Assume same schedule for all batch items
+        num_updates = len(update_timesteps)
+        
+        if num_updates > 0:
+            # Extract RGB images only for update timesteps
+            # obs_dict['rgb_image']: (B, T, H, W, C)
+            update_images_list = []
+            for t_idx in update_timesteps:
+                update_images_list.append(obs_dict['rgb_image'][:, t_idx])  # (B, H, W, C)
+            
+            update_images = torch.stack(update_images_list, dim=1)  # (B, num_updates, H, W, C)
+            
+            # Flatten batch and time for VLM processing
+            update_images_flat = update_images.reshape(B * num_updates, *update_images.shape[2:])
+            
+            # Repeat instructions for each update
+            update_instructions = [inst for inst in instruction_text for _ in range(num_updates)]
+            
+            # Run System 2 (VLM + Encoder)
+            plan_output = self.planner.plan(
+                image=update_images_flat,
+                instruction=update_instructions,
+                training=self.training,
+                return_reconstruction_loss=True
+            )
+            
+            # Reshape computed latents: (B*num_updates, latent_dim) -> (B, num_updates, latent_dim)
+            computed_latents = plan_output['latent'].view(B, num_updates, -1)
+            
+            # Expand latents to all timesteps using group IDs
+            task_latents_expanded = torch.zeros(
+                B, T, self.latent_dim,
+                device=computed_latents.device,
+                dtype=computed_latents.dtype
+            )
+            
+            clamped_group_ids = latent_group_id.clamp(0, num_updates - 1)
+            batch_indices = torch.arange(B, device=computed_latents.device)[:, None].expand(B, T)
+            task_latents_expanded = computed_latents[batch_indices, clamped_group_ids]
+            
+            reconstruction_loss = plan_output['reconstruction_loss']
+            reconstruction_loss_dict = plan_output.get('reconstruction_loss_dict', {})
+            
+        else:
+            # No updates in this batch (shouldn't happen normally)
+            task_latents_expanded = torch.zeros(B, T, self.latent_dim, device=device)
+            reconstruction_loss = torch.tensor(0.0, device=device)
+            reconstruction_loss_dict = {}
+        
+        # Apply gradient scaling from DP3 to encoder
+        if self.training:
+            task_latents_expanded = self.scale_grad(task_latents_expanded, scale=0.1)
+        
+        task_latents_expanded = task_latents_expanded.to(dtype=torch.float32)
+        
+        # Prepare observation dict with task latents
         obs_dict_with_task = {
             k: v.to(device) if isinstance(v, torch.Tensor) else v
             for k, v in obs_dict.items()
             if k not in ['instruction', 'rgb_image']
-        } 
-        obs_dict_with_task['task_latent'] = task_latents_expanded.to(device) 
+        }
+        obs_dict_with_task['task_latent'] = task_latents_expanded
 
-        # System 1
+        # System 1: Diffusion Policy
         if compute_loss and actions is not None:
             batch = {
                 'obs': obs_dict_with_task,
@@ -202,16 +260,24 @@ class EndToEndRobotPolicy(nn.Module):
             }
 
             diff_loss, loss_dict = self.policy.compute_loss(batch)
-
-            target = pooled.detach()
+            diff_loss = diff_loss * dp3_grad_scale
             
-            distill_loss = torch.nn.functional.mse_loss(reconstructed, target)
+            # NEW: Compute temporal consistency loss
+            temporal_loss, temporal_loss_dict = self.temporal_consistency_loss(
+                latents=task_latents_expanded,
+                update_mask=latent_update_mask
+            )
             
-            distill_weight = 1.0 
-            total_loss = diff_loss + (distill_weight * distill_loss)
+            # Total loss
+            total_loss = diff_loss + reconstruction_loss + temporal_loss
             
-            loss_dict['diffusion_loss'] = diff_loss.item()
-            loss_dict['vlm_distill_loss'] = distill_loss.item()
+            # Logging
+            loss_dict['diffusion_loss'] = diff_loss.item() / max(dp3_grad_scale, 1e-8)
+            if reconstruction_loss_dict:
+                loss_dict.update(reconstruction_loss_dict)
+            loss_dict.update(temporal_loss_dict)
+            loss_dict['dp3_grad_scale'] = dp3_grad_scale
+            loss_dict['num_vlm_calls'] = num_updates  # Track efficiency
 
             return total_loss, loss_dict
         else:
@@ -244,6 +310,9 @@ class EndToEndTrainer:
         lr_scheduler_type="cosine",
         lr_warmup_steps=500,
         num_epochs=3000,
+        # Phased training config
+        pre_alignment_epochs=50,      # Phase 1: encoder only with reconstruction
+        warmup_epochs=50,             # Phase 2: gradual DP3 introduction
         # Logging and checkpointing
         log_dir="./logs/e2e_training",
         checkpoint_every=200,
@@ -255,6 +324,11 @@ class EndToEndTrainer:
         self.device = torch.device(device)
         self.gradient_accumulate_every = gradient_accumulate_every
         self.num_epochs = num_epochs
+        
+        # Phased training configuration
+        self.pre_alignment_epochs = pre_alignment_epochs
+        self.warmup_epochs = warmup_epochs
+        self.total_warmup_epochs = pre_alignment_epochs + warmup_epochs
         
         # Setup datasets and dataloaders
         self.train_dataset = train_dataset
@@ -324,6 +398,8 @@ class EndToEndTrainer:
         
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(exist_ok=True, parents=True)
+        self.writer = SummaryWriter(log_dir=str(self.log_dir / 'tensorboard'))
+
         self.checkpoint_dir = self.log_dir / 'checkpoints'
         self.checkpoint_dir.mkdir(exist_ok=True)
         
@@ -337,6 +413,13 @@ class EndToEndTrainer:
         self.sample_every = sample_every
         
         self.train_sampling_batch = None
+
+        signal.signal(signal.SIGTERM, self._emergency_save)
+
+    def _emergency_save(self, signum, frame):
+        print("\n[!] SIGTERM received. Saving emergency checkpoint...")
+        self.save_checkpoint(tag='emergency_shutdown')
+        sys.exit(0)
         
     def _setup_optimizer(self, latent_lr, policy_lr, weight_decay):
         """Setup optimizer with different learning rates for different components"""
@@ -376,16 +459,42 @@ class EndToEndTrainer:
         
         return scheduler
     
+    def get_training_phase(self, epoch):
+        """Determine current training phase"""
+        if epoch < self.pre_alignment_epochs:
+            return "pre_alignment"
+        elif epoch < self.total_warmup_epochs:
+            return "warmup"
+        else:
+            return "main_training"
+    
+    def get_dp3_grad_scale(self, epoch):
+        """Get DP3 gradient scale for current epoch"""
+        phase = self.get_training_phase(epoch)
+        
+        if phase == "pre_alignment":
+            # Phase 1: No DP3 gradients at all
+            return 0.0
+        elif phase == "warmup":
+            # Phase 2: Linear warmup from 0 to 1
+            warmup_progress = (epoch - self.pre_alignment_epochs) / self.warmup_epochs
+            return warmup_progress
+        else:
+            # Phase 3: Full DP3 gradients
+            return 1.0
+    
     def train_epoch(self, epoch):
         """Train for one epoch"""
         self.model.train()
         epoch_loss = 0.0
         epoch_metrics = {}
         
-        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
+        phase = self.get_training_phase(epoch)
+        dp3_grad_scale = self.get_dp3_grad_scale(epoch)
+        
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch} [{phase}]")
         
         for batch_idx, batch in enumerate(pbar):
-            # Move batch 
             obs_dict = {}
             for k, v in batch['obs'].items():
                 if isinstance(v, torch.Tensor):
@@ -399,14 +508,22 @@ class EndToEndTrainer:
                 self.train_sampling_batch = {
                     'obs': obs_dict,
                     'action': actions,
-                    'instruction': instructions
+                    'instruction': instructions,
+                    'latent_update_mask': batch['latent_update_mask'].to(self.device),  
+                    'latent_group_id': batch['latent_group_id'].to(self.device),
                 }
+
+            latent_update_mask = batch['latent_update_mask'].to(self.device)
+            latent_group_id = batch['latent_group_id'].to(self.device)
             
             loss, loss_dict = self.model(
                 obs_dict=obs_dict,
                 instruction_text=instructions,
                 actions=actions,
-                compute_loss=True
+                compute_loss=True,
+                dp3_grad_scale=dp3_grad_scale,
+                latent_update_mask=latent_update_mask,
+                latent_group_id=latent_group_id
             )
             
             # Scale loss for gradient accumulation
@@ -414,7 +531,14 @@ class EndToEndTrainer:
             loss.backward()
             
             if (batch_idx + 1) % self.gradient_accumulate_every == 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.writer.add_scalar('Charts/Gradient_Norm', total_norm, self.global_step)
+
+                if self.global_step % 100 == 0:
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None and 'policy' in name: 
+                            self.writer.add_histogram(f'Gradients/{name}', param.grad, self.global_step)
+
                 self.optimizer.step()
                 self.optimizer.zero_grad()
                 self.lr_scheduler.step()
@@ -425,14 +549,21 @@ class EndToEndTrainer:
                 # Logging
                 self.global_step += 1
                 epoch_loss += loss.item() * self.gradient_accumulate_every
+
+                self.writer.add_scalar('Train/Total_Loss', loss.item() * self.gradient_accumulate_every, self.global_step)
+                self.writer.add_scalar('Train/DP3_Grad_Scale', dp3_grad_scale, self.global_step)
+                self.writer.add_scalar('Train/LR_Policy', self.optimizer.param_groups[1]['lr'], self.global_step)
                 
                 for k, v in loss_dict.items():
+                    self.writer.add_scalar(f'Loss_Components/{k}', v, self.global_step)
                     if k not in epoch_metrics:
                         epoch_metrics[k] = 0.0
                     epoch_metrics[k] += v
                 
                 pbar.set_postfix({
                     'loss': f"{loss.item() * self.gradient_accumulate_every:.4f}",
+                    'phase': phase,
+                    'dp3_scale': f"{dp3_grad_scale:.2f}",
                     'step': self.global_step,
                     'lr': f"{self.lr_scheduler.get_last_lr()[0]:.2e}"
                 })
@@ -440,6 +571,8 @@ class EndToEndTrainer:
         num_batches = len(self.train_loader) // self.gradient_accumulate_every
         epoch_loss /= num_batches
         epoch_metrics = {k: v / num_batches for k, v in epoch_metrics.items()}
+        
+        epoch_metrics['phase'] = phase
         
         return epoch_loss, epoch_metrics
     
@@ -461,17 +594,26 @@ class EndToEndTrainer:
                     obs_dict[k] = v
             actions = batch['action'].to(self.device, non_blocking=True)
             instructions = batch['obs']['instruction']
+
+            latent_update_mask = batch['latent_update_mask'].to(self.device)
+            latent_group_id = batch['latent_group_id'].to(self.device)
             
+            # Always use full gradients for validation
             loss, loss_dict = policy(
                 obs_dict=obs_dict,
                 instruction_text=instructions,
                 actions=actions,
-                compute_loss=True
+                compute_loss=True,
+                dp3_grad_scale=1.0,  # Full scale for validation
+                latent_update_mask=latent_update_mask,
+                latent_group_id=latent_group_id
             )
             
             val_loss += loss.item()
-            
+            self.writer.add_scalar('Val/Total_Loss', val_loss, self.global_step)
+
             for k, v in loss_dict.items():
+                self.writer.add_scalar(f'Val_Metrics/{k}', v, self.global_step)
                 if k not in val_metrics:
                     val_metrics[k] = 0.0
                 val_metrics[k] += v
@@ -497,16 +639,27 @@ class EndToEndTrainer:
         gt_action = batch['action'].to(self.device, non_blocking=True)
         instructions = batch['obs']['instruction']
 
+        latent_update_mask = batch.get('latent_update_mask')
+        latent_group_id = batch.get('latent_group_id')
         
+        if latent_update_mask is not None:
+            latent_update_mask = latent_update_mask.to(self.device)
+        if latent_group_id is not None:
+            latent_group_id = latent_group_id.to(self.device)
+
         result = policy(
             obs_dict=obs_dict,
             instruction_text=instructions,
             actions=None,
-            compute_loss=False
+            compute_loss=False,
+            latent_update_mask=latent_update_mask,
+            latent_group_id=latent_group_id
         )
         
         pred_action = result['action_pred']
         mse = torch.nn.functional.mse_loss(pred_action, gt_action)
+
+        self.writer.add_scalar('Analysis/Action_MSE', mse.item(), self.global_step)
         
         return {'train_action_mse_error': mse.item()}
     
@@ -626,13 +779,17 @@ class EndToEndTrainer:
             start_epoch = self.load_checkpoint(resume_from) + 1
         
         print(f"\n{'='*80}")
-        print(f"Starting End-to-End VLA Training")
+        print(f"Starting End-to-End VLA Training with Phased Strategy")
         print(f"{'='*80}")
         print(f"Epochs: {start_epoch} -> {self.num_epochs}")
         print(f"Device: {self.device}")
         print(f"Batch size: {self.train_loader.batch_size}")
         print(f"Gradient accumulation: {self.gradient_accumulate_every}")
         print(f"Use EMA: {self.use_ema}")
+        print(f"\nPhased Training Schedule:")
+        print(f"  Phase 1 (Pre-alignment):  Epochs 0-{self.pre_alignment_epochs} (DP3 frozen)")
+        print(f"  Phase 2 (Warmup):         Epochs {self.pre_alignment_epochs}-{self.total_warmup_epochs} (DP3 gradual)")
+        print(f"  Phase 3 (Main Training):  Epochs {self.total_warmup_epochs}+ (DP3 full)")
         print(f"{'='*80}\n")
         
         for epoch in range(start_epoch, self.num_epochs):
@@ -640,7 +797,11 @@ class EndToEndTrainer:
             
             # Training
             train_loss, train_metrics = self.train_epoch(epoch)
-            print(f"\nEpoch {epoch} - Train Loss: {train_loss:.4f}")
+            
+            # phase-specific info
+            phase = train_metrics.get('phase', 'unknown')
+            dp3_scale = train_metrics.get('dp3_grad_scale', 1.0)
+            print(f"\nEpoch {epoch} [{phase}] - Train Loss: {train_loss:.4f} (DP3 scale: {dp3_scale:.2f})")
             
             step_log = {
                 'epoch': epoch,
@@ -708,7 +869,9 @@ def main():
         pad_after=7,   # n_action_steps - 1
         seed=42,
         val_ratio=0.02,
-        max_train_episodes=90
+        max_train_episodes=90,
+        latent_update_interval=3,      # 9Hz update at ~27Hz policy (assuming 16 horizon ~ 0.5s)
+        randomize_update_interval=True
     )
     
     val_dataset = train_dataset.get_validation_dataset()
@@ -733,34 +896,27 @@ def main():
         n_groups=8,
         num_inference_steps=10,
         obs_as_global_cond=True,
-        use_pc_color=False,
+        use_pc_color=True,
         pointnet_type="pointnet",
         # Noise scheduler config
         num_train_timesteps=100,
         beta_start=0.0001,
         beta_end=0.02,
         beta_schedule="squaredcos_cap_v2",
-        # LoRA config
-        use_lora=False,
-        lora_r=8,
-        lora_alpha=16,
-        lora_dropout=0.05,
     )
 
     trainer = EndToEndTrainer(
         model=model,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
-        env_runner=None,
         # Learning rates
-        vlm_lr=5e-5,
         latent_lr=1e-4,
         policy_lr=1e-4,
         weight_decay=1e-6,
         # Training config
-        batch_size=128,
+        batch_size=16,
         num_workers=8,
-        gradient_accumulate_every=1,
+        gradient_accumulate_every=8,
         # EMA config
         use_ema=True,
         ema_update_after_step=0,
@@ -771,12 +927,15 @@ def main():
         # LR scheduler
         lr_scheduler_type="cosine",
         lr_warmup_steps=500,
-        num_epochs=3000,
+        num_epochs=450,
+        # Phased training config
+        pre_alignment_epochs=5,   # Phase 1: Encoder learns with reconstruction only
+        warmup_epochs=10,          # Phase 2: Gradual DP3 gradient introduction
         # Logging
         log_dir=f'./logs/e2e_vla',
-        checkpoint_every=200,
-        val_every=1,
-        sample_every=5,
+        checkpoint_every=50,
+        val_every=20,
+        sample_every=40,
         device=device,
     )
     
