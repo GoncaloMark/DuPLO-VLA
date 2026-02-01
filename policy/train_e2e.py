@@ -18,7 +18,7 @@ if __name__ == "__main__":
     sys.path.append(ROOT_DIR)
     os.chdir(ROOT_DIR)
 
-from policy.vlm.latent_encoder import TemporalConsistencyLoss
+from vlm.latent_encoder import TemporalConsistencyLoss
 from vlm.vlm import VisualTaskPlanner
 from diffusion_policy_3d.policy.dp3 import DP3
 from diffusion_policy_3d.model.diffusion.ema_model import EMAModel
