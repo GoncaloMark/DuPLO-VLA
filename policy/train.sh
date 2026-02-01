@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=e2e_vla_metaworld-tiny                   
-#SBATCH --output="e2e_vla_metaworld-tiny-%j.out" 
+#SBATCH --job-name=e2e_vla_metaworld                   
+#SBATCH --output="e2e_vla_metaworld-%j.out" 
 #SBATCH --nodes=1                         
 #SBATCH --ntasks=1                        
 #SBATCH --cpus-per-task=8                 
@@ -27,7 +27,6 @@ echo "============================================"
 
 
 echo "Starting End-to-End VLA Training..."
-echo "Task: pick-place"
 echo "Start Time: $(date)"
 echo "============================================"
 
