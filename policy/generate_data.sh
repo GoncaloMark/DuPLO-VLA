@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=e2e_vla_metaworld-tiny                   
-#SBATCH --output="e2e_vla_metaworld-tiny-%j.out" 
+#SBATCH --job-name=metaworld_data_gen             
+#SBATCH --output="metaworld_data_gen-%j.out" 
 #SBATCH --nodes=1                         
 #SBATCH --ntasks=1                        
 #SBATCH --cpus-per-task=8                 
@@ -26,15 +26,35 @@ echo "  Version: $(python --version)"
 echo "============================================"
 
 
-echo "Starting End-to-End VLA Training..."
-echo "Task: pick-place"
+echo "Starting Metaworld Data Generation..."
 echo "Start Time: $(date)"
 echo "============================================"
 
-python train_e2e.py
+./gen_multitask_ds.sh
 
 echo "============================================"
-echo "Training completed!"
+echo "Generation completed!"
+echo "End Time: $(date)"
+echo "============================================"
+
+echo "Starting Metaworld Data Augmentation..."
+echo "Start Time: $(date)"
+echo "============================================"
+
+./gen_augment_ds.sh
+
+echo "============================================"
+echo "Augmentation completed!"
+echo "End Time: $(date)"
+echo "============================================"
+
+echo "Collapsing Metaworld Data To Single Dataset..."
+echo "Start Time: $(date)"
+echo "============================================"
+
+python collapse_ds.py
+
+echo "Collapsing Completed!"
 echo "End Time: $(date)"
 echo "============================================"
 
