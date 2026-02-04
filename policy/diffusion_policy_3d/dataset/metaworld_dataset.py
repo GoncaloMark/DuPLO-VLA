@@ -18,6 +18,7 @@ class MetaworldDataset(BaseDataset):
             seed=42,
             val_ratio=0.0,
             max_train_episodes=None,
+            max_val_episodes=None,
             latent_update_interval=3,  # Update every N timesteps 
             randomize_update_interval=True,
             ):
@@ -44,6 +45,13 @@ class MetaworldDataset(BaseDataset):
             mask=train_mask, 
             max_n=max_train_episodes, 
             seed=seed)
+        
+        if max_val_episodes is not None:
+            val_mask = downsample_mask(
+                mask=val_mask,
+                max_n=max_val_episodes,
+                seed=seed
+            )
 
         self.sampler = SequenceSampler(
             replay_buffer=self.replay_buffer, 
@@ -54,6 +62,7 @@ class MetaworldDataset(BaseDataset):
         )
 
         self.train_mask = train_mask
+        self.val_mask = val_mask
         self.horizon = horizon
         self.pad_before = pad_before
         self.pad_after = pad_after
@@ -69,11 +78,10 @@ class MetaworldDataset(BaseDataset):
             sequence_length=self.horizon,
             pad_before=self.pad_before, 
             pad_after=self.pad_after,
-            episode_mask=~self.train_mask
+            episode_mask=self.val_mask  
         )
-        val_set.train_mask = ~self.train_mask
+        val_set.train_mask = self.val_mask
         val_set.randomize_update_interval = False
-
         return val_set
 
     def get_normalizer(self, mode='limits', **kwargs):

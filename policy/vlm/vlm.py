@@ -5,7 +5,7 @@ import numpy as np
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from torch.amp import autocast
 
-from latent_encoder import LatentTaskEncoder, ReconstructionLoss
+from .latent_encoder import LatentTaskEncoder, ReconstructionLoss
 
 class VisualTaskPlanner(nn.Module):
     """

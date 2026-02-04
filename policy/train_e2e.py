@@ -1,3 +1,4 @@
+import itertools
 import signal
 import torch
 import torch.nn as nn
@@ -333,6 +334,25 @@ class EndToEndTrainer:
         # Setup datasets and dataloaders
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
+
+        self.global_step = 0
+
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(exist_ok=True, parents=True)
+        self.writer = SummaryWriter(log_dir=str(self.log_dir / 'tensorboard'))
+
+        self.checkpoint_dir = self.log_dir / 'checkpoints'
+        self.checkpoint_dir.mkdir(exist_ok=True)
+        
+        self.epoch = 0
+        self.best_val_loss = float('inf')
+        self.best_test_score = float('-inf')
+        
+        self.checkpoint_every = checkpoint_every
+        self.val_every = val_every
+        self.sample_every = sample_every
+        
+        self.train_sampling_batch = None
         
         self.train_loader = DataLoader(
             train_dataset,
@@ -356,10 +376,13 @@ class EndToEndTrainer:
         normalizer = train_dataset.get_normalizer()
         normalizer.params_dict['task_latent'] = nn.ParameterDict({
             'mean': torch.zeros(self.model.latent_dim),
-            'std': torch.ones(self.model.latent_dim)
+            'scale': torch.ones(self.model.latent_dim),
+            'offset': torch.zeros(self.model.latent_dim)
         })
 
         self.model.policy.set_normalizer(normalizer)
+
+        self.model.policy.normalizer = self.model.policy.normalizer.to(device)
         
         self.optimizer = self._setup_optimizer(
             latent_lr=latent_lr,
@@ -395,24 +418,11 @@ class EndToEndTrainer:
                 min_value=ema_min_value,
                 max_value=ema_max_value
             )
-        
-        self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(exist_ok=True, parents=True)
-        self.writer = SummaryWriter(log_dir=str(self.log_dir / 'tensorboard'))
 
-        self.checkpoint_dir = self.log_dir / 'checkpoints'
-        self.checkpoint_dir.mkdir(exist_ok=True)
-        
-        self.global_step = 0
-        self.epoch = 0
-        self.best_val_loss = float('inf')
-        self.best_test_score = float('-inf')
-        
-        self.checkpoint_every = checkpoint_every
-        self.val_every = val_every
-        self.sample_every = sample_every
-        
-        self.train_sampling_batch = None
+        self.model.policy.normalizer = self.model.policy.normalizer.to(device)
+        if use_ema:
+            assert self.ema_model is not None
+            self.ema_model.policy.normalizer = self.ema_model.policy.normalizer.to(device)
 
         signal.signal(signal.SIGTERM, self._emergency_save)
 
@@ -584,8 +594,10 @@ class EndToEndTrainer:
         
         val_loss = 0.0
         val_metrics = {}
+
+        val_batches = list(itertools.islice(self.val_loader, 100))
         
-        for batch in tqdm(self.val_loader, desc="Validating"):
+        for batch in tqdm(val_batches, desc="Validating"):
             obs_dict = {}
             for k, v in batch['obs'].items():
                 if isinstance(v, torch.Tensor):
@@ -618,8 +630,8 @@ class EndToEndTrainer:
                     val_metrics[k] = 0.0
                 val_metrics[k] += v
         
-        val_loss /= len(self.val_loader)
-        val_metrics = {k: v / len(self.val_loader) for k, v in val_metrics.items()}
+        val_loss /= len(val_batches)
+        val_metrics = {k: v / len(val_batches) for k, v in val_metrics.items()}
         
         return val_loss, val_metrics
     
@@ -869,8 +881,9 @@ def main():
         pad_after=7,   # n_action_steps - 1
         seed=42,
         val_ratio=0.02,
-        max_train_episodes=90,
-        latent_update_interval=3,      # 9Hz update at ~27Hz policy (assuming 16 horizon ~ 0.5s)
+        max_train_episodes=50,
+        max_val_episodes=10,
+        latent_update_interval=3,      # 9Hz update at 27Hz policy (assuming 16 horizon is like 0.5s)
         randomize_update_interval=True
     )
     
@@ -927,7 +940,7 @@ def main():
         # LR scheduler
         lr_scheduler_type="cosine",
         lr_warmup_steps=500,
-        num_epochs=450,
+        num_epochs=200,
         # Phased training config
         pre_alignment_epochs=5,   # Phase 1: Encoder learns with reconstruction only
         warmup_epochs=10,          # Phase 2: Gradual DP3 gradient introduction
