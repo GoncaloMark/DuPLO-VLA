@@ -5,7 +5,7 @@ import numpy as np
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from torch.amp import autocast
 
-from .latent_encoder import LatentTaskEncoder, ReconstructionLoss
+from .latent_encoder import LatentTaskEncoder, ReconstructionLoss, TaskContrastiveLoss
 
 class VisualTaskPlanner(nn.Module):
     """
@@ -17,27 +17,26 @@ class VisualTaskPlanner(nn.Module):
         model_name: str = "Qwen/Qwen3-VL-8B-Instruct",
         freeze_vlm: bool = True,
         latent_dim: int = 512,
-        num_pooling_queries: int = 8,
+        num_pooling_queries: int = 16,      # Bumped from 8 — richer scenes need more queries
         num_attention_heads: int = 8,
         num_vlm_layers_to_use: int = 4,
         layer_fusion_method: str = "learned_weighted",
         use_multi_layer: bool = True,
         dropout: float = 0.1,
+        contrastive_weight: float = 0.1,
+        contrastive_temperature: float = 0.07,
     ):
         super().__init__()
-        
-        # Load VLM
+
         self.vlm = Qwen3VLForConditionalGeneration.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
             device_map="auto"
         )
         self.processor = Qwen3VLProcessor.from_pretrained(model_name)
-        
-        # Get VLM hidden dimension
+
         vlm_hidden_dim = self.vlm.config.text_config.hidden_size
-        
-        # Initialize task encoder
+
         self.task_encoder = LatentTaskEncoder(
             vlm_hidden_dim=vlm_hidden_dim,
             latent_dim=latent_dim,
@@ -48,218 +47,226 @@ class VisualTaskPlanner(nn.Module):
             use_multi_layer=use_multi_layer,
             dropout=dropout,
         )
-        
-        # Move encoder to bfloat16
         self.task_encoder = self.task_encoder.to(torch.bfloat16)
-        
-        # Reconstruction loss for pre-alignment
+
+        self.num_pooling_queries = num_pooling_queries
+        self.vlm_hidden_dim      = vlm_hidden_dim
+
+        # ── Reconstruction loss ──────────────────────────────────────────────────
+        # pooled_weight targets evenly-spaced VLM sequence positions (external target).
+        # sequence_weight targets mean-pooled VLM hidden states (also external).
+        # Neither target passes through the task encoder == no circularity.
         self.reconstruction_loss = ReconstructionLoss(
             pooled_weight=1.0,
             sequence_weight=0.5,
             latent_reg_weight=0.01
         )
-        
-        # Freeze VLM 
+
+        self.contrastive_loss   = TaskContrastiveLoss(temperature=contrastive_temperature)
+        self.contrastive_weight = contrastive_weight
+
         if freeze_vlm:
             for p in self.vlm.parameters():
                 p.requires_grad = False
-        
+
         self.use_multi_layer = use_multi_layer
+
+    def _make_pooled_flat_target(self, last_hidden_state: torch.Tensor) -> torch.Tensor:
+        """
+        Build a reconstruction target for the pooled features that does NOT
+        go through the task encoder (fixes the circular target bug).
+
+        Strategy: evenly sample num_pooling_queries token positions from the
+        VLM last-layer hidden states and flatten them. These positions tend to
+        cover both vision tokens and language tokens.
+
+        Args:
+            last_hidden_state: (B, seq_len, hidden_dim)
+        Returns:
+            target: (B, num_pooling_queries * hidden_dim)
+        """
+        B, seq_len, hidden_dim = last_hidden_state.shape
+        n = self.num_pooling_queries
+
+        # Evenly spaced indices, clamped to valid range
+        indices = torch.linspace(0, seq_len - 1, n).long().to(last_hidden_state.device)
+        target  = last_hidden_state[:, indices, :]              # (B, n, hidden_dim)
+        return target.reshape(B, n * hidden_dim).detach()       # stop-gradient
 
     def extract_features_batch(
         self,
         images,
         texts,
-        training = False,
-        return_all_layers = True
-    ):
+        training: bool = False,
+        return_all_layers: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[Tuple]]:
         """
         Extract features from VLM for a batch of images and texts.
-        
+
         Args:
-            images: (B, H, W, C) or (B, C, H, W)
-            texts: list[str] length B
-            training: whether in training mode
-            return_all_layers: whether to return all hidden states for multi-layer fusion
-            
+            images:           (B, H, W, C) numpy array or torch tensor
+            texts:            list[str] length B
+            training:         whether in training mode (affects grad ctx)
+            return_all_layers: whether to return all hidden states
+
         Returns:
             last_hidden_state: (B, seq_len, hidden_dim)
-            all_hidden_states: Optional tuple of all layer hidden states
+            all_hidden_states: tuple of layer tensors, or None
         """
-        # Convert to numpy if tensor
         if isinstance(images, torch.Tensor):
             images = images.cpu().numpy()
-        
-        # Handle different image formats
+
         if isinstance(images, np.ndarray):
-            # Single image (H, C, W) -> (H, W, C)
-            if images.ndim == 3 and images.shape[1] == 3:
-                images = np.transpose(images, (0, 2, 1))
+            # Normalise to (B, H, W, C)
+            if images.ndim == 3:
+                # Single image — could be (H, W, C) or (C, H, W)
+                if images.shape[0] == 3:          # (C, H, W)
+                    images = np.transpose(images, (1, 2, 0))
                 images = [images]
-            # Batch of images (B, C, H, W) -> (B, H, W, C)
-            elif images.ndim == 4 and images.shape[1] == 3:
-                images = np.transpose(images, (0, 2, 3, 1))
+            elif images.ndim == 4:
+                # Batch: (B, C, H, W) → (B, H, W, C)  or already (B, H, W, C)
+                if images.shape[1] == 3:
+                    images = np.transpose(images, (0, 2, 3, 1))
                 images = [images[i] for i in range(len(images))]
-            # Already in correct format
             else:
-                if images.ndim == 3:
-                    images = [images]
-                else:
-                    images = [images[i] for i in range(len(images))]
-        
-        # Prepare text with image tokens
+                raise ValueError(f"Unexpected image ndim: {images.ndim}")
+        elif not isinstance(images, list):
+            raise TypeError(f"Unexpected images type: {type(images)}")
+
         text_with_image = [
             f"<|vision_start|><|image_pad|><|vision_end|>{t}"
             for t in texts
         ]
-        
-        # Process inputs
+
         inputs = self.processor(
             text=text_with_image,
             images=images,
             return_tensors="pt",
-            padding=True
+            padding=True,
         ).to(self.vlm.device)
-        
-        # Extract features from VLM
-        if training and not self.vlm.training:
-            # If in training mode but VLM is frozen, still use no_grad
-            with torch.no_grad():
-                with autocast(device_type="cuda", dtype=torch.bfloat16):
-                    outputs = self.vlm(**inputs, output_hidden_states=True)
-        else:
+
+        # VLM forward 
+        vlm_needs_grad = any(p.requires_grad for p in self.vlm.parameters())
+        ctx = torch.enable_grad() if (training and vlm_needs_grad) else torch.no_grad()
+        with ctx:
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 outputs = self.vlm(**inputs, output_hidden_states=True)
-        
+
         last_hidden_state = outputs.hidden_states[-1]
         all_hidden_states = outputs.hidden_states if return_all_layers else None
-        
+
         return last_hidden_state, all_hidden_states
 
     def plan(
         self,
         image,
-        instruction,
-        training = True,
-        return_attention_weights = False,
-        return_reconstruction_loss = False,
+        instruction: Union[str, List[str]],
+        training: bool = True,
+        return_attention_weights: bool = False,
+        return_reconstruction_loss: bool = False,
     ) -> dict:
         """
-        Generate task-specific latent representation from image and instruction.
-        
+        Generate task-specific latent from image + instruction.
+
         Args:
-            image: Single image (H, W, C) or batch (B, H, W, C)
-            instruction: Single string or list of strings (length B)
-            training: whether in training mode
-            return_attention_weights: whether to return Q-Pooler attention weights
-            return_reconstruction_loss: whether to compute reconstruction loss
-            
-        Returns:
-            dict with keys:
-                - latent: (B, latent_dim) or (latent_dim,) if single
-                - encoder_output: full output dict from encoder
-                - reconstruction_loss: Optional, if return_reconstruction_loss=True
-                - reconstruction_loss_dict: Optional dict with loss components
+            image:                       (H, W, C) or (B, H, W, C)
+            instruction:                 str or list[str]
+            training:                    whether in training mode
+            return_attention_weights:    return Q-Pooler attn weights
+            return_reconstruction_loss:  compute reconstruction + contrastive loss
+
+        Returns dict with keys:
+            latent               (B, latent_dim) or (latent_dim,) if unbatched
+            encoder_output       full encoder output dict
+            reconstruction_loss  Optional scalar
+            reconstruction_loss_dict  Optional dict
         """
-        # Handle batching
-        is_batched = isinstance(instruction, list)
-        
-        if not is_batched:
-            images = image.unsqueeze(0) if torch.is_tensor(image) else np.expand_dims(image, 0)
+        if not isinstance(instruction, list):
+            images       = image.unsqueeze(0) if torch.is_tensor(image) else np.expand_dims(image, 0)
             instructions = [instruction]
         else:
-            images = image
+            images       = image
             instructions = instruction
-        
+
+        # Object-centric prompt shorter and more spatial than the original verbose one.
+        # Shorter completions == hidden states are more object/goal shaped for DP3.
         prompts = [
-            f"""You are controlling a robotic arm that needs to complete the following instruction: {instr}
-Given the image and instruction, provide a detailed plan enriched with spatial cues and object descriptions with relative positions.
-
-Use common sense to identify objects (cups, bottles, fruits, boxes, tools, etc.).
-
-Principles:
-- Avoid blocked or surrounded objects
-- Avoid objects that would cause others to topple
-- Select objects matching the user prompt
-
-Plan:"""
+            f"{instr}\n"
+            f"Identify the target object, its current location, goal position, and any obstacles."
             for instr in instructions
         ]
-        
-        # Extract VLM features
+
         last_hidden_state, all_hidden_states = self.extract_features_batch(
-            images, 
-            prompts, 
+            images,
+            prompts,
             training=training,
-            return_all_layers=self.use_multi_layer
+            return_all_layers=self.use_multi_layer,
         )
-        
-        # Encode with task encoder
+
         encoder_output = self.task_encoder(
             vlm_features=last_hidden_state,
             vlm_hidden_states=all_hidden_states,
-            return_attention_weights=return_attention_weights
+            return_attention_weights=return_attention_weights,
         )
-        
+
         latent = encoder_output['latent']
-        
-        # Compute reconstruction loss if requested
-        reconstruction_loss = None
+
+        reconstruction_loss      = None
         reconstruction_loss_dict = None
+
         if return_reconstruction_loss:
+            pooled_flat_target = self._make_pooled_flat_target(last_hidden_state)
+
             reconstruction_loss, reconstruction_loss_dict = self.reconstruction_loss(
                 encoder_output=encoder_output,
                 vlm_features=last_hidden_state,
-                pooled_flat_target=encoder_output['pooled_flat']  # Use encoder's own pooling as target
+                pooled_flat_target=pooled_flat_target,   
             )
-        
-        # Unbatch if single input
-        if not is_batched:
+
+            contrastive_loss = self.contrastive_loss(latent, instructions)
+            reconstruction_loss      = reconstruction_loss + self.contrastive_weight * contrastive_loss
+            reconstruction_loss_dict = reconstruction_loss_dict or {}
+            reconstruction_loss_dict['contrastive'] = contrastive_loss.item()
+
+        # Unbatch for single-item calls
+        if not isinstance(instruction, list):
             latent = latent[0]
-            encoder_output = {k: v[0] if isinstance(v, torch.Tensor) and v.ndim > 1 else v 
-                            for k, v in encoder_output.items()}
-        
+            encoder_output = {
+                k: v[0] if isinstance(v, torch.Tensor) and v.ndim > 1 else v
+                for k, v in encoder_output.items()
+            }
+
         return {
-            'latent': latent,
-            'encoder_output': encoder_output,
-            'reconstruction_loss': reconstruction_loss,
-            'reconstruction_loss_dict': reconstruction_loss_dict
+            'latent':                    latent,
+            'encoder_output':            encoder_output,
+            'reconstruction_loss':       reconstruction_loss,
+            'reconstruction_loss_dict':  reconstruction_loss_dict,
         }
-    
+
     def train(self, mode: bool = True):
-        """
-        Override train mode to ensure VLM stays in eval mode
-        """
         super().train(mode)
-        # Force VLM to eval, even if planner is training
         if self.vlm is not None:
-            self.vlm.eval()
+            self.vlm.eval()   # VLM always stays in eval (BN/dropout stability)
         return self
-    
+
     def get_encoder_parameters(self):
-        """Get parameters of the task encoder only (for selective training)"""
         return self.task_encoder.parameters()
-    
+
     def get_vlm_parameters(self):
-        """Get parameters of the VLM only"""
         return self.vlm.parameters()
-    
+
     def freeze_vlm(self):
-        """Freeze VLM parameters"""
         for p in self.vlm.parameters():
             p.requires_grad = False
-    
+
     def unfreeze_vlm(self):
-        """Unfreeze VLM parameters"""
         for p in self.vlm.parameters():
             p.requires_grad = True
-    
+
     def freeze_encoder(self):
-        """Freeze task encoder parameters"""
         for p in self.task_encoder.parameters():
             p.requires_grad = False
-    
+
     def unfreeze_encoder(self):
-        """Unfreeze task encoder parameters"""
         for p in self.task_encoder.parameters():
             p.requires_grad = True

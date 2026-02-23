@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional
+from typing import List, Tuple, Optional
 
 class QPooler(nn.Module):
     """
@@ -135,7 +135,62 @@ class MultiLayerFeatureExtractor(nn.Module):
             fused = self.fusion_proj(concatenated)
         
         return fused
+    
+class TaskContrastiveLoss(nn.Module):
+    """
+    InfoNCE-style contrastive loss over task instructions.
+    Latents from the same instruction (task) should cluster together;
+    different instructions should be pushed apart.
+    
+    Uses the instruction string itself as the task label.
+    """
+    def __init__(self, temperature: float = 0.07):
+        super().__init__()
+        self.temperature = temperature
 
+    def forward(self, latents: torch.Tensor, instructions: List[str]) -> torch.Tensor:
+        """
+        Args:
+            latents:      (B, latent_dim) - normalized task latents
+            instructions: list of B instruction strings (task labels)
+        Returns:
+            scalar loss
+        """
+        B = latents.shape[0]
+        if B < 2:
+            return torch.tensor(0.0, device=latents.device)
+
+        # Build same-task label matrix
+        labels = torch.zeros(B, B, device=latents.device)
+        for i in range(B):
+            for j in range(B):
+                if i != j and instructions[i] == instructions[j]:
+                    labels[i, j] = 1.0
+
+        # If no positive pairs in batch, skip 
+        if labels.sum() == 0:
+            return torch.tensor(0.0, device=latents.device)
+
+        latents_norm = F.normalize(latents, dim=-1)
+        similarity = (latents_norm @ latents_norm.T) / self.temperature  # (B, B)
+
+        # Mask out diagonal (self-similarity)
+        mask = torch.eye(B, dtype=torch.bool, device=latents.device)
+        similarity = similarity.masked_fill(mask, -1e9)
+        labels     = labels.masked_fill(mask, 0.0)
+
+        # Per-row InfoNCE: log( sum(exp(pos)) / sum(exp(all)) )
+        exp_sim = similarity.exp()
+        positive_sum = (exp_sim * labels).sum(dim=-1)          # (B,)
+        total_sum    = exp_sim.sum(dim=-1)                     # (B,)
+
+        # Only average over rows that actually have a positive
+        has_positive = (labels.sum(dim=-1) > 0)
+        if not has_positive.any():
+            return torch.tensor(0.0, device=latents.device)
+
+        loss = -torch.log(positive_sum[has_positive] / total_sum[has_positive] + 1e-8)
+        return loss.mean()
 
 class LatentTaskEncoder(nn.Module):
     """
@@ -252,7 +307,7 @@ class LatentTaskEncoder(nn.Module):
             'reconstructed_pooled': reconstructed_pooled,
             'pooled_features': pooled_features,
             'reconstructed_sequence': reconstructed_sequence,
-            'pooled_flat': pooled_flat  # For reconstruction loss
+            'pooled_flat': pooled_flat,  # For reconstruction loss
         }
         
         if return_attention_weights:
@@ -356,19 +411,19 @@ class ReconstructionLoss(nn.Module):
         # Pooled feature reconstruction loss
         pooled_recon_loss = F.mse_loss(
             encoder_output['reconstructed_pooled'],
-            pooled_flat_target
+            pooled_flat_target.detach()
         )
         
         # Sequence-level reconstruction loss (reconstruct mean-pooled features)
         mean_pooled_target = vlm_features.mean(dim=1)  # (batch, hidden_dim)
         sequence_recon_loss = F.mse_loss(
             encoder_output['reconstructed_sequence'],
-            mean_pooled_target
+            mean_pooled_target.detach()
         )
         
         # Latent regularization (prevent collapse, encourage spread)
         latent = encoder_output['latent']
-        latent_reg = -torch.log(latent.std(dim=0).mean() + 1e-8)  # Encourage variance
+        latent_reg = -torch.log(latent.std(dim=0).mean() + 1e-8).clamp(max=10.0)  # Encourage variance
         
         # Total loss
         total_loss = (
