@@ -136,60 +136,102 @@ class MultiLayerFeatureExtractor(nn.Module):
         
         return fused
     
-class TaskContrastiveLoss(nn.Module):
+class HierarchicalContrastiveLoss(nn.Module):
     """
-    InfoNCE-style contrastive loss over task instructions.
-    Latents from the same instruction (task) should cluster together;
-    different instructions should be pushed apart.
-    
-    Uses the instruction string itself as the task label.
-    """
-    def __init__(self, temperature: float = 0.07):
-        super().__init__()
-        self.temperature = temperature
+    Three-level contrastive loss:
 
-    def forward(self, latents: torch.Tensor, instructions: List[str]) -> torch.Tensor:
+    Level 1 — Same episode     → similarity target 1.0  (same scene, same goal)
+    Level 2 — Same task, diff episode → target 0.5      (same intent, diff scene)
+    Level 3 — Different task   → target 0.0             (pushed apart)
+
+    Why three levels?
+    Keying only on task_name collapses all episodes of 'pick-place' to one
+    point, making the latent blind to where the puck actually is.
+    Keying only on episode_id gives no signal that 'pick-place' episodes
+    are related to each other at all.
+    The soft middle target lets the encoder learn:
+        "same task = nearby region of latent space,
+        same episode = almost identical latent,
+        different task = far apart"
+    """
+    def __init__(
+        self,
+        temperature: float = 0.07,
+        same_episode_weight: float = 1.0,   # how hard to pull same-episode pairs
+        same_task_weight: float = 0.5,      # how hard to pull same-task pairs
+    ):
+        super().__init__()
+        self.temperature         = temperature
+        self.same_episode_weight = same_episode_weight
+        self.same_task_weight    = same_task_weight
+
+    def _build_labels(
+        self,
+        task_names:  List[str],
+        episode_ids: List[int],
+        device: torch.device,
+    ) -> torch.Tensor:
         """
-        Args:
-            latents:      (B, latent_dim) - normalized task latents
-            instructions: list of B instruction strings (task labels)
+        Build a soft similarity target matrix.
+
         Returns:
-            scalar loss
+            labels: (B, B) float tensor with values in {0.0, 0.5, 1.0}
         """
+        B = len(task_names)
+
+        # Vectorized task comparison
+        task_hashes = torch.tensor(
+            [hash(t) for t in task_names], device=device
+        )
+        same_task = (task_hashes.unsqueeze(0) == task_hashes.unsqueeze(1))  # (B, B) bool
+
+        # Vectorized episode comparison
+        ep_ids = torch.tensor(episode_ids, device=device)
+        same_ep = (ep_ids.unsqueeze(0) == ep_ids.unsqueeze(1))              # (B, B) bool
+
+        # Build soft label matrix — order matters: episode overrides task
+        labels = torch.zeros(B, B, device=device)
+        labels[same_task]                   = self.same_task_weight    # 0.5
+        labels[same_ep]                     = self.same_episode_weight # 1.0 (overrides 0.5)
+        labels.fill_diagonal_(0.0)          # exclude self-similarity
+
+        return labels
+
+    def forward(
+        self,
+        latents:     torch.Tensor,   # (B, latent_dim)
+        task_names:  List[str],
+        episode_ids: List[int],
+    ) -> torch.Tensor:
         B = latents.shape[0]
         if B < 2:
             return torch.tensor(0.0, device=latents.device)
 
-        # Build same-task label matrix
-        labels = torch.zeros(B, B, device=latents.device)
-        for i in range(B):
-            for j in range(B):
-                if i != j and instructions[i] == instructions[j]:
-                    labels[i, j] = 1.0
+        labels = self._build_labels(task_names, episode_ids, latents.device)
 
-        # If no positive pairs in batch, skip 
+        # Skip batch if no useful signal (all different tasks, no pairs)
         if labels.sum() == 0:
             return torch.tensor(0.0, device=latents.device)
 
         latents_norm = F.normalize(latents, dim=-1)
-        similarity = (latents_norm @ latents_norm.T) / self.temperature  # (B, B)
+        similarity   = (latents_norm @ latents_norm.T) / self.temperature  # (B, B)
 
-        # Mask out diagonal (self-similarity)
-        mask = torch.eye(B, dtype=torch.bool, device=latents.device)
-        similarity = similarity.masked_fill(mask, -1e9)
-        labels     = labels.masked_fill(mask, 0.0)
+        # Mask diagonal
+        eye        = torch.eye(B, dtype=torch.bool, device=latents.device)
+        similarity = similarity.masked_fill(eye, -1e9)
 
-        # Per-row InfoNCE: log( sum(exp(pos)) / sum(exp(all)) )
-        exp_sim = similarity.exp()
-        positive_sum = (exp_sim * labels).sum(dim=-1)          # (B,)
+        # Soft InfoNCE: instead of binary positive/negative,
+        # weight the numerator by the soft label (0, 0.5, or 1.0)
+        exp_sim      = similarity.exp()                        # (B, B)
+        weighted_pos = (exp_sim * labels).sum(dim=-1)          # (B,) — soft positive sum
         total_sum    = exp_sim.sum(dim=-1)                     # (B,)
 
-        # Only average over rows that actually have a positive
-        has_positive = (labels.sum(dim=-1) > 0)
-        if not has_positive.any():
+        # Only compute loss for rows that have at least one positive-ish pair
+        has_signal = labels.sum(dim=-1) > 0
+        if not has_signal.any():
             return torch.tensor(0.0, device=latents.device)
 
-        loss = -torch.log(positive_sum[has_positive] / total_sum[has_positive] + 1e-8)
+        loss = -torch.log(weighted_pos[has_signal] / (total_sum[has_signal] + 1e-8))
         return loss.mean()
 
 class LatentTaskEncoder(nn.Module):
@@ -212,7 +254,7 @@ class LatentTaskEncoder(nn.Module):
         self.latent_dim = latent_dim
         self.use_multi_layer = use_multi_layer
         
-        # Multi-layer feature extraction (optional)
+        # Multi-layer feature extraction 
         if use_multi_layer:
             self.feature_extractor = MultiLayerFeatureExtractor(
                 hidden_dim=vlm_hidden_dim,
@@ -228,7 +270,6 @@ class LatentTaskEncoder(nn.Module):
             dropout=dropout
         )
         
-        # Encoder: pooled features -> latent representation
         self.encoder = nn.Sequential(
             nn.Linear(vlm_hidden_dim * num_pooling_queries, 2048),
             nn.LayerNorm(2048),

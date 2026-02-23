@@ -8,7 +8,7 @@ TASKS=(
     "reach"
 )
 
-NUM_EPISODES=100  # Per task
+NUM_EPISODES=20  # Per task
 ROOT_DIR="data/"
 
 echo "=================================="

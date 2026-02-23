@@ -9,9 +9,10 @@ from diffusion_policy_3d.common.sampler import (
 from diffusion_policy_3d.model.common.normalizer import LinearNormalizer
 from diffusion_policy_3d.dataset.base_dataset import BaseDataset
 
+
 class MetaworldDataset(BaseDataset):
     def __init__(self,
-            zarr_path, 
+            zarr_path,
             horizon=1,
             pad_before=0,
             pad_after=0,
@@ -19,75 +20,61 @@ class MetaworldDataset(BaseDataset):
             val_ratio=0.0,
             max_train_episodes=None,
             max_val_episodes=None,
-            latent_update_interval=3,  # Update every N timesteps 
+            latent_update_interval=3,
             randomize_update_interval=True,
             ):
         super().__init__()
 
         self.replay_buffer = ReplayBuffer.copy_from_path(
             zarr_path,
-            keys=[
-                'state',
-                'action',
-                'point_cloud',
-                'instruction',
-                'img'
-            ],
+            keys=['state', 'action', 'point_cloud', 'instruction', 'task_name', 'episode_id', 'img'],
         )
 
-        val_mask = get_val_mask(
-            n_episodes=self.replay_buffer.n_episodes, 
+        val_mask   = get_val_mask(
+            n_episodes=self.replay_buffer.n_episodes,
             val_ratio=val_ratio,
             seed=seed)
         train_mask = ~val_mask
 
-        train_mask = downsample_mask(
-            mask=train_mask, 
-            max_n=max_train_episodes, 
-            seed=seed)
-        
+        train_mask = downsample_mask(mask=train_mask, max_n=max_train_episodes, seed=seed)
         if max_val_episodes is not None:
-            val_mask = downsample_mask(
-                mask=val_mask,
-                max_n=max_val_episodes,
-                seed=seed
-            )
+            val_mask = downsample_mask(mask=val_mask, max_n=max_val_episodes, seed=seed)
 
         self.sampler = SequenceSampler(
-            replay_buffer=self.replay_buffer, 
+            replay_buffer=self.replay_buffer,
             sequence_length=horizon,
-            pad_before=pad_before, 
+            pad_before=pad_before,
             pad_after=pad_after,
-            episode_mask=train_mask
+            episode_mask=train_mask,
         )
 
         self.train_mask = train_mask
-        self.val_mask = val_mask
-        self.horizon = horizon
+        self.val_mask   = val_mask
+        self.horizon    = horizon
         self.pad_before = pad_before
-        self.pad_after = pad_after
+        self.pad_after  = pad_after
 
-        self.latent_update_interval = latent_update_interval
+        self.latent_update_interval   = latent_update_interval
         self.randomize_update_interval = randomize_update_interval
         self.rng = np.random.RandomState(seed)
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
         val_set.sampler = SequenceSampler(
-            replay_buffer=self.replay_buffer, 
+            replay_buffer=self.replay_buffer,
             sequence_length=self.horizon,
-            pad_before=self.pad_before, 
+            pad_before=self.pad_before,
             pad_after=self.pad_after,
-            episode_mask=self.val_mask  
+            episode_mask=self.val_mask,
         )
-        val_set.train_mask = self.val_mask
+        val_set.train_mask               = self.val_mask
         val_set.randomize_update_interval = False
         return val_set
 
     def get_normalizer(self, mode='limits', **kwargs):
         data = {
-            'action': self.replay_buffer['action'],
-            'agent_pos': self.replay_buffer['state'][...,:],
+            'action':      self.replay_buffer['action'],
+            'agent_pos':   self.replay_buffer['state'][...,:],
             'point_cloud': self.replay_buffer['point_cloud'],
         }
         normalizer = LinearNormalizer()
@@ -97,83 +84,66 @@ class MetaworldDataset(BaseDataset):
     def __len__(self) -> int:
         return len(self.sampler)
 
-    def _sample_to_data(self, sample):
-        agent_pos = sample['state'].astype(np.float32)
-        point_cloud = sample['point_cloud'].astype(np.float32)
-        rgb_image = sample['img'].astype(np.uint8)
-        
-        instruction = sample['instruction']
-        if isinstance(instruction, np.ndarray):
-            instruction = instruction.tolist()
-            if isinstance(instruction, list):
-                # Take ONLY the first instruction (they're all identical anyway)
-                instruction = str(instruction[0])
-            else:
-                instruction = str(instruction)
+    def _extract_scalar_string(self, value) -> str:
+        """Safely collapse a (horizon,) string array to a single string."""
+        if isinstance(value, np.ndarray):
+            value = value.tolist()
+        if isinstance(value, list):
+            value = value[0]   # all elements are identical within an episode
+        return str(value)
 
-        data = {
+    def _sample_to_data(self, sample):
+        agent_pos   = sample['state'].astype(np.float32)
+        point_cloud = sample['point_cloud'].astype(np.float32)
+        rgb_image   = sample['img'].astype(np.uint8)
+
+        instruction = self._extract_scalar_string(sample['instruction'])
+        task_name   = self._extract_scalar_string(sample['task_name'])  
+
+        episode_id = int(self._extract_scalar_string(sample['episode_id']))
+
+        return {
             'obs': {
                 'point_cloud': point_cloud,
-                'agent_pos': agent_pos,
-                'instruction': instruction,  
-                'rgb_image': rgb_image,
+                'agent_pos':   agent_pos,
+                'instruction': instruction,
+                'task_name':   task_name,   
+                'rgb_image':   rgb_image,
+                'episode_id':  episode_id,
             },
-            'action': sample['action'].astype(np.float32)
+            'action': sample['action'].astype(np.float32),
         }
 
-        return data
-    
     def _create_latent_update_schedule(self, horizon):
-        """
-        Create a schedule indicating which timesteps should trigger VLM updates.
-        
-        Returns:
-            latent_update_mask: (horizon,) bool array, True = compute new latent
-            latent_group_id: (horizon,) int array, which latent group each timestep belongs to
-        """
-        # Determine update interval for this sample
         if self.randomize_update_interval:
-            # Randomize between interval-1 and interval+1 for robustness
             min_interval = max(1, self.latent_update_interval - 1)
             max_interval = self.latent_update_interval + 1
             interval = self.rng.randint(min_interval, max_interval + 1)
         else:
             interval = self.latent_update_interval
-        
-        # Create update mask: True at indices [0, interval, 2*interval, ...]
-        latent_update_mask = np.zeros(horizon, dtype=bool)
+
+        latent_update_mask          = np.zeros(horizon, dtype=bool)
         latent_update_mask[::interval] = True
-        
-        # Create group IDs: which latent each timestep should use
-        latent_group_id = np.arange(horizon) // interval
-        
+        latent_group_id             = np.arange(horizon) // interval
+
         return latent_update_mask, latent_group_id
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.sampler.sample_sequence(idx)
-        data = self._sample_to_data(sample)
+        data   = self._sample_to_data(sample)
 
         latent_update_mask, latent_group_id = self._create_latent_update_schedule(self.horizon)
 
-        torch_data = {}
-
+        torch_data: Dict = {}
         for k, v in data.items():
             if isinstance(v, dict):
                 torch_data[k] = {}
                 for kk, vv in v.items():
-                    if isinstance(vv, np.ndarray):
-                        torch_data[k][kk] = torch.from_numpy(vv)
-                    else:
-                        torch_data[k][kk] = vv
+                    torch_data[k][kk] = torch.from_numpy(vv) if isinstance(vv, np.ndarray) else vv
             else:
-                if isinstance(v, np.ndarray):
-                    torch_data[k] = torch.from_numpy(v)
-                else:
-                    torch_data[k] = v
+                torch_data[k] = torch.from_numpy(v) if isinstance(v, np.ndarray) else v
 
         torch_data['latent_update_mask'] = torch.from_numpy(latent_update_mask)
-        torch_data['latent_group_id'] = torch.from_numpy(latent_group_id)
+        torch_data['latent_group_id']    = torch.from_numpy(latent_group_id)
 
         return torch_data
-
-

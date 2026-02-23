@@ -37,16 +37,16 @@ echo "Generation completed!"
 echo "End Time: $(date)"
 echo "============================================"
 
-echo "Starting Metaworld Data Augmentation..."
-echo "Start Time: $(date)"
-echo "============================================"
+# echo "Starting Metaworld Data Augmentation..."
+# echo "Start Time: $(date)"
+# echo "============================================"
 
-./gen_augment_ds.sh
+# ./gen_augment_ds.sh
 
-echo "============================================"
-echo "Augmentation completed!"
-echo "End Time: $(date)"
-echo "============================================"
+# echo "============================================"
+# echo "Augmentation completed!"
+# echo "End Time: $(date)"
+# echo "============================================"
 
 echo "Collapsing Metaworld Data To Single Dataset..."
 echo "Start Time: $(date)"

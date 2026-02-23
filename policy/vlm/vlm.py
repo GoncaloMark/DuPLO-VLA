@@ -5,7 +5,7 @@ import numpy as np
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from torch.amp import autocast
 
-from .latent_encoder import LatentTaskEncoder, ReconstructionLoss, TaskContrastiveLoss
+from .latent_encoder import HierarchicalContrastiveLoss, LatentTaskEncoder, ReconstructionLoss
 
 class VisualTaskPlanner(nn.Module):
     """
@@ -17,13 +17,13 @@ class VisualTaskPlanner(nn.Module):
         model_name: str = "Qwen/Qwen3-VL-8B-Instruct",
         freeze_vlm: bool = True,
         latent_dim: int = 512,
-        num_pooling_queries: int = 16,      # Bumped from 8 — richer scenes need more queries
+        num_pooling_queries: int = 16,      
         num_attention_heads: int = 8,
         num_vlm_layers_to_use: int = 4,
         layer_fusion_method: str = "learned_weighted",
         use_multi_layer: bool = True,
         dropout: float = 0.1,
-        contrastive_weight: float = 0.1,
+        contrastive_weight: float = 0.01,
         contrastive_temperature: float = 0.07,
     ):
         super().__init__()
@@ -52,7 +52,6 @@ class VisualTaskPlanner(nn.Module):
         self.num_pooling_queries = num_pooling_queries
         self.vlm_hidden_dim      = vlm_hidden_dim
 
-        # ── Reconstruction loss ──────────────────────────────────────────────────
         # pooled_weight targets evenly-spaced VLM sequence positions (external target).
         # sequence_weight targets mean-pooled VLM hidden states (also external).
         # Neither target passes through the task encoder == no circularity.
@@ -62,7 +61,11 @@ class VisualTaskPlanner(nn.Module):
             latent_reg_weight=0.01
         )
 
-        self.contrastive_loss   = TaskContrastiveLoss(temperature=contrastive_temperature)
+        self.contrastive_loss = HierarchicalContrastiveLoss(
+            temperature=contrastive_temperature,
+            same_episode_weight=1.0,
+            same_task_weight=0.5,
+        )
         self.contrastive_weight = contrastive_weight
 
         if freeze_vlm:
@@ -161,6 +164,8 @@ class VisualTaskPlanner(nn.Module):
         self,
         image,
         instruction: Union[str, List[str]],
+        task_names=None,
+        episode_ids = None,
         training: bool = True,
         return_attention_weights: bool = False,
         return_reconstruction_loss: bool = False,
@@ -188,8 +193,6 @@ class VisualTaskPlanner(nn.Module):
             images       = image
             instructions = instruction
 
-        # Object-centric prompt shorter and more spatial than the original verbose one.
-        # Shorter completions == hidden states are more object/goal shaped for DP3.
         prompts = [
             f"{instr}\n"
             f"Identify the target object, its current location, goal position, and any obstacles."
@@ -223,7 +226,12 @@ class VisualTaskPlanner(nn.Module):
                 pooled_flat_target=pooled_flat_target,   
             )
 
-            contrastive_loss = self.contrastive_loss(latent, instructions)
+            contrastive_loss = self.contrastive_loss(
+                latent,
+                task_names  if task_names  is not None else instructions,
+                episode_ids if episode_ids is not None else list(range(len(instructions))),
+            )
+
             reconstruction_loss      = reconstruction_loss + self.contrastive_weight * contrastive_loss
             reconstruction_loss_dict = reconstruction_loss_dict or {}
             reconstruction_loss_dict['contrastive'] = contrastive_loss.item()
