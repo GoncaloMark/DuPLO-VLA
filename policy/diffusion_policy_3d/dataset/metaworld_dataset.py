@@ -22,13 +22,22 @@ class MetaworldDataset(BaseDataset):
             max_val_episodes=None,
             latent_update_interval=3,
             randomize_update_interval=True,
+            use_precomputed_vlm=False,
             ):
         super().__init__()
 
-        self.replay_buffer = ReplayBuffer.copy_from_path(
-            zarr_path,
-            keys=['state', 'action', 'point_cloud', 'instruction', 'task_name', 'episode_id', 'img'],
-        )
+        keys = ['state', 'action', 'point_cloud', 'instruction',
+                'task_name', 'episode_id', 'img']
+        if use_precomputed_vlm:
+            # vlm_hidden_states: (T, num_layers, max_seq_len, hidden_dim) float16
+            # vlm_seq_len: (T,) int32  actual token count before zero-padding
+            # goal_vlm_hidden_states: same shape — final frame of the episode
+            # goal_vlm_seq_len: (T,) int32
+            keys += ['vlm_hidden_states', 'vlm_seq_len', 'goal_vlm_hidden_states', 'goal_vlm_seq_len']
+
+        self.use_precomputed_vlm = use_precomputed_vlm
+
+        self.replay_buffer = ReplayBuffer.copy_from_path(zarr_path, keys=keys)
 
         val_mask   = get_val_mask(
             n_episodes=self.replay_buffer.n_episodes,
@@ -54,7 +63,7 @@ class MetaworldDataset(BaseDataset):
         self.pad_before = pad_before
         self.pad_after  = pad_after
 
-        self.latent_update_interval   = latent_update_interval
+        self.latent_update_interval = latent_update_interval
         self.randomize_update_interval = randomize_update_interval
         self.rng = np.random.RandomState(seed)
 
@@ -67,7 +76,7 @@ class MetaworldDataset(BaseDataset):
             pad_after=self.pad_after,
             episode_mask=self.val_mask,
         )
-        val_set.train_mask               = self.val_mask
+        val_set.train_mask = self.val_mask
         val_set.randomize_update_interval = False
         return val_set
 
@@ -85,11 +94,10 @@ class MetaworldDataset(BaseDataset):
         return len(self.sampler)
 
     def _extract_scalar_string(self, value) -> str:
-        """Safely collapse a (horizon,) string array to a single string."""
         if isinstance(value, np.ndarray):
             value = value.tolist()
         if isinstance(value, list):
-            value = value[0]   # all elements are identical within an episode
+            value = value[0]
         return str(value)
 
     def _sample_to_data(self, sample):
@@ -98,21 +106,25 @@ class MetaworldDataset(BaseDataset):
         rgb_image   = sample['img'].astype(np.uint8)
 
         instruction = self._extract_scalar_string(sample['instruction'])
-        task_name   = self._extract_scalar_string(sample['task_name'])  
+        task_name   = self._extract_scalar_string(sample['task_name'])
+        episode_id  = int(self._extract_scalar_string(sample['episode_id']))
 
-        episode_id = int(self._extract_scalar_string(sample['episode_id']))
-
-        return {
-            'obs': {
-                'point_cloud': point_cloud,
-                'agent_pos':   agent_pos,
-                'instruction': instruction,
-                'task_name':   task_name,   
-                'rgb_image':   rgb_image,
-                'episode_id':  episode_id,
-            },
-            'action': sample['action'].astype(np.float32),
+        obs = {
+            'point_cloud': point_cloud,
+            'agent_pos':   agent_pos,
+            'instruction': instruction,
+            'task_name':   task_name,
+            'rgb_image':   rgb_image,
+            'episode_id':  episode_id,
         }
+
+        if self.use_precomputed_vlm:
+            obs['vlm_hidden_states'] = sample['vlm_hidden_states'].astype(np.float16)
+            obs['vlm_seq_len'] = sample['vlm_seq_len'].astype(np.int32)
+            obs['goal_vlm_hidden_states'] = sample['goal_vlm_hidden_states'].astype(np.float16)
+            obs['goal_vlm_seq_len'] = sample['goal_vlm_seq_len'].astype(np.int32)
+
+        return {'obs': obs, 'action': sample['action'].astype(np.float32)}
 
     def _create_latent_update_schedule(self, horizon):
         if self.randomize_update_interval:
@@ -122,9 +134,9 @@ class MetaworldDataset(BaseDataset):
         else:
             interval = self.latent_update_interval
 
-        latent_update_mask          = np.zeros(horizon, dtype=bool)
+        latent_update_mask = np.zeros(horizon, dtype=bool)
         latent_update_mask[::interval] = True
-        latent_group_id             = np.arange(horizon) // interval
+        latent_group_id = np.arange(horizon) // interval
 
         return latent_update_mask, latent_group_id
 
