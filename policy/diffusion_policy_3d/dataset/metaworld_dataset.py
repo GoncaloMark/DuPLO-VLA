@@ -26,8 +26,7 @@ class MetaworldDataset(BaseDataset):
             ):
         super().__init__()
 
-        keys = ['state', 'action', 'point_cloud', 'instruction',
-                'task_name', 'episode_id', 'img']
+        keys = ['state', 'action', 'point_cloud', 'instruction', 'task_name', 'episode_id', 'img']
         if use_precomputed_vlm:
             # vlm_hidden_states: (T, num_layers, max_seq_len, hidden_dim) float16
             # vlm_seq_len: (T,) int32  actual token count before zero-padding
@@ -58,10 +57,10 @@ class MetaworldDataset(BaseDataset):
         )
 
         self.train_mask = train_mask
-        self.val_mask   = val_mask
-        self.horizon    = horizon
+        self.val_mask = val_mask
+        self.horizon = horizon
         self.pad_before = pad_before
-        self.pad_after  = pad_after
+        self.pad_after = pad_after
 
         self.latent_update_interval = latent_update_interval
         self.randomize_update_interval = randomize_update_interval
@@ -82,8 +81,8 @@ class MetaworldDataset(BaseDataset):
 
     def get_normalizer(self, mode='limits', **kwargs):
         data = {
-            'action':      self.replay_buffer['action'],
-            'agent_pos':   self.replay_buffer['state'][...,:],
+            'action': self.replay_buffer['action'],
+            'agent_pos': self.replay_buffer['state'][...,:],
             'point_cloud': self.replay_buffer['point_cloud'],
         }
         normalizer = LinearNormalizer()
@@ -93,6 +92,23 @@ class MetaworldDataset(BaseDataset):
     def __len__(self) -> int:
         return len(self.sampler)
 
+    def get_sample_weights(self) -> torch.Tensor:
+        """
+        Inverse-frequency weights per sample for WeightedRandomSampler.
+        Gives each task equal expected representation regardless of episode count.
+        SequenceSampler.indices contains the flat-buffer start index for each sample;
+        task_name is constant within an episode so reading the first frame is sufficient.
+        """
+        task_names_flat = np.array([str(x) for x in self.replay_buffer['task_name'][:]])
+        indices = self.sampler.indices   # list of start positions in flat buffer
+        sample_tasks = [task_names_flat[i] for i in indices]
+
+        counts = {}
+        for t in sample_tasks:
+            counts[t] = counts.get(t, 0) + 1
+        weights = torch.tensor([1.0 / counts[t] for t in sample_tasks], dtype=torch.float)
+        return weights
+
     def _extract_scalar_string(self, value) -> str:
         if isinstance(value, np.ndarray):
             value = value.tolist()
@@ -101,21 +117,21 @@ class MetaworldDataset(BaseDataset):
         return str(value)
 
     def _sample_to_data(self, sample):
-        agent_pos   = sample['state'].astype(np.float32)
+        agent_pos = sample['state'].astype(np.float32)
         point_cloud = sample['point_cloud'].astype(np.float32)
-        rgb_image   = sample['img'].astype(np.uint8)
+        rgb_image = sample['img'].astype(np.uint8)
 
         instruction = self._extract_scalar_string(sample['instruction'])
-        task_name   = self._extract_scalar_string(sample['task_name'])
-        episode_id  = int(self._extract_scalar_string(sample['episode_id']))
+        task_name = self._extract_scalar_string(sample['task_name'])
+        episode_id = int(self._extract_scalar_string(sample['episode_id']))
 
         obs = {
             'point_cloud': point_cloud,
-            'agent_pos':   agent_pos,
+            'agent_pos': agent_pos,
             'instruction': instruction,
-            'task_name':   task_name,
-            'rgb_image':   rgb_image,
-            'episode_id':  episode_id,
+            'task_name': task_name,
+            'rgb_image': rgb_image,
+            'episode_id': episode_id,
         }
 
         if self.use_precomputed_vlm:
@@ -156,6 +172,6 @@ class MetaworldDataset(BaseDataset):
                 torch_data[k] = torch.from_numpy(v) if isinstance(v, np.ndarray) else v
 
         torch_data['latent_update_mask'] = torch.from_numpy(latent_update_mask)
-        torch_data['latent_group_id']    = torch.from_numpy(latent_group_id)
+        torch_data['latent_group_id'] = torch.from_numpy(latent_group_id)
 
         return torch_data
