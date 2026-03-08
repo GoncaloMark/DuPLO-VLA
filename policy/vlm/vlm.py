@@ -14,7 +14,7 @@ LATENT_VAR_REG_WEIGHT = 0.01  # anti-collapse: keeps latent dimensions spread ou
 class VisualTaskPlanner(nn.Module):
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3-VL-8B-Instruct",
+        model_name: str = "Qwen/Qwen3-VL-4B-Instruct",
         freeze_vlm: bool = True,
         latent_dim: int = 512,
         num_pooling_queries: int = 16,
