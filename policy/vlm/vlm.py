@@ -1,4 +1,4 @@
-from typing import Union, List, Optional, Tuple
+from typing import Union, List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,6 +14,7 @@ LATENT_VAR_REG_WEIGHT = 0.01  # anti-collapse: keeps latent dimensions spread ou
 class VisualTaskPlanner(nn.Module):
     def __init__(
         self,
+        load_vlm: bool = True,
         model_name: str = "Qwen/Qwen3-VL-4B-Instruct",
         freeze_vlm: bool = True,
         latent_dim: int = 512,
@@ -28,10 +29,11 @@ class VisualTaskPlanner(nn.Module):
     ):
         super().__init__()
 
-        self.vlm = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16, device_map="auto",
-        )
-        self.processor = Qwen3VLProcessor.from_pretrained(model_name)
+        if load_vlm:
+            self.vlm = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_name, torch_dtype=torch.bfloat16, device_map="auto",
+            )
+            self.processor = Qwen3VLProcessor.from_pretrained(model_name)
 
         vlm_hidden_dim = self.vlm.config.text_config.hidden_size
 
@@ -57,7 +59,7 @@ class VisualTaskPlanner(nn.Module):
             same_task_weight=0.5,
         )
 
-        if freeze_vlm:
+        if freeze_vlm and load_vlm:
             for p in self.vlm.parameters():
                 p.requires_grad = False
 
@@ -108,7 +110,7 @@ class VisualTaskPlanner(nn.Module):
 
         key_padding_mask = None
         if seq_len_tensor is not None:
-            B, max_seq = last_hidden.shape[:2]
+            _, max_seq = last_hidden.shape[:2]
             pos = torch.arange(max_seq, device=enc_device).unsqueeze(0)
             key_padding_mask = pos >= seq_len_tensor.to(enc_device).unsqueeze(1)
 
@@ -126,7 +128,6 @@ class VisualTaskPlanner(nn.Module):
         episode_ids=None,
         goal_hidden_states: Optional[torch.Tensor] = None,
         goal_seq_len: Optional[torch.Tensor] = None,
-        return_attention_weights: bool = False,
         return_encoder_loss: bool = False,
     ) -> dict:
         enc_out, _ = self._encode_hidden_states(vlm_hidden_states, vlm_seq_len)
@@ -211,8 +212,10 @@ class VisualTaskPlanner(nn.Module):
         return self
 
     def get_encoder_parameters(self): return self.task_encoder.parameters()
-    def get_vlm_parameters(self): return self.vlm.parameters()
+    def get_vlm_parameters(self): return self.vlm.parameters() or None
     def freeze_vlm(self):
-        for p in self.vlm.parameters(): p.requires_grad = False
+        if self.vlm:
+            for p in self.vlm.parameters(): p.requires_grad = False
     def unfreeze_vlm(self):
-        for p in self.vlm.parameters(): p.requires_grad = True
+        if self.vlm:
+            for p in self.vlm.parameters(): p.requires_grad = True

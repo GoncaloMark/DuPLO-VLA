@@ -9,6 +9,8 @@ from diffusion_policy_3d.common.sampler import (
 from diffusion_policy_3d.model.common.normalizer import LinearNormalizer
 from diffusion_policy_3d.dataset.base_dataset import BaseDataset
 
+import zarr
+
 
 class MetaworldDataset(BaseDataset):
     def __init__(self,
@@ -23,6 +25,8 @@ class MetaworldDataset(BaseDataset):
             latent_update_interval=3,
             randomize_update_interval=True,
             use_precomputed_vlm=False,
+            aws_key=None,       
+            aws_secret=None,
             ):
         super().__init__()
 
@@ -36,7 +40,21 @@ class MetaworldDataset(BaseDataset):
 
         self.use_precomputed_vlm = use_precomputed_vlm
 
-        self.replay_buffer = ReplayBuffer.copy_from_path(zarr_path, keys=keys)
+        if zarr_path.startswith("s3://"):
+            zarr_root = zarr.open_group(
+                store=zarr_path.replace("s3://", ""),
+                mode='r',
+                storage_options={
+                    'key': aws_key,
+                    'secret': aws_secret,
+                    'client_kwargs': {'region_name': "eu-west-2"}
+                },
+            )
+            
+            self.replay_buffer = ReplayBuffer(root=zarr_root)
+            
+        else:
+            self.replay_buffer = ReplayBuffer.copy_from_path(zarr_path, keys=keys)
 
         val_mask   = get_val_mask(
             n_episodes=self.replay_buffer.n_episodes,
