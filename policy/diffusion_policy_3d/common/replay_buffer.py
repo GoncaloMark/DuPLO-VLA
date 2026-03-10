@@ -111,7 +111,7 @@ class ReplayBuffer:
         data = root.require_group('data', overwrite=False)
         meta = root.require_group('meta', overwrite=False)
         if 'episode_ends' not in meta:
-            episode_ends = meta.zeros(name='episode_ends', shape=(0,), dtype=np.int64,
+            episode_ends = meta.zeros('episode_ends', shape=(0,), dtype=np.int64,
                 compressor=None, overwrite=False)
         return cls(root=root)
     
