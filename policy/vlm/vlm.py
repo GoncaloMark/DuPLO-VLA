@@ -30,13 +30,15 @@ class VisualTaskPlanner(nn.Module):
     ):
         super().__init__()
 
+        self.vlm = None
+
         if load_vlm:
             self.vlm = Qwen3VLForConditionalGeneration.from_pretrained(
                 model_name, torch_dtype=torch.bfloat16, device_map="auto",
             )
             self.processor = Qwen3VLProcessor.from_pretrained(model_name)
 
-        vlm_hidden_dim = self.vlm.config.text_config.hidden_size or vlm_dim
+        vlm_hidden_dim = self.vlm.config.text_config.hidden_size if self.vlm else vlm_dim
 
         self.task_encoder = LatentTaskEncoder(
             vlm_hidden_dim=vlm_hidden_dim,
@@ -61,6 +63,7 @@ class VisualTaskPlanner(nn.Module):
         )
 
         if freeze_vlm and load_vlm:
+            assert self.vlm
             for p in self.vlm.parameters():
                 p.requires_grad = False
 
