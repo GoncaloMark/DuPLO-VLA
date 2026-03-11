@@ -56,7 +56,7 @@ class DP3(BasePolicy):
         obs_shape_meta = shape_meta['obs']
         obs_dict = dict_apply(obs_shape_meta, lambda x: x['shape'])
 
-        latent_dim = shape_meta['obs'].get('task_latent', {}).get('shape', [512])[0]
+        latent_dim = 512
 
         obs_encoder = DP3Encoder(observation_space=obs_dict,
                                                    img_crop_shape=crop_shape,
