@@ -18,6 +18,7 @@ class VisualTaskPlanner(nn.Module):
         model_name: str = "Qwen/Qwen3-VL-4B-Instruct",
         freeze_vlm: bool = True,
         latent_dim: int = 512,
+        vlm_dim: int | None = None,
         num_pooling_queries: int = 16,
         num_attention_heads: int = 8,
         num_vlm_layers_to_use: int = 4,
@@ -35,7 +36,7 @@ class VisualTaskPlanner(nn.Module):
             )
             self.processor = Qwen3VLProcessor.from_pretrained(model_name)
 
-        vlm_hidden_dim = self.vlm.config.text_config.hidden_size
+        vlm_hidden_dim = self.vlm.config.text_config.hidden_size or vlm_dim
 
         self.task_encoder = LatentTaskEncoder(
             vlm_hidden_dim=vlm_hidden_dim,
