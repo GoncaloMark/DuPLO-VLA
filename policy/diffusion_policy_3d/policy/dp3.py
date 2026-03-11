@@ -272,8 +272,22 @@ class DP3(BasePolicy):
 
     def compute_loss(self, batch):
         # normalize input
+        task_latent_key = 'task_latent' 
+        task_latent = batch['obs'].pop(task_latent_key, None)
 
         nobs = self.normalizer.normalize(batch['obs'])
+
+        if task_latent is not None:
+            # Cast bfloat16 to float32 to match PointNet and DP3
+            task_latent = task_latent.to(dtype=torch.float32)
+            
+            # If the latent is [B, 512] but observations are [B, T, ...], expand the time dimension
+            if task_latent.dim() == 2 and 'state' in nobs:
+                B, T = nobs['state'].shape[:2]
+                task_latent = task_latent.unsqueeze(1).expand(B, T, -1)
+                
+            nobs[task_latent_key] = task_latent
+
         nactions = self.normalizer['action'].normalize(batch['action'])
 
         if not self.use_pc_color:
