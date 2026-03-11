@@ -121,12 +121,14 @@ class MetaworldDataset(BaseDataset):
         max_valid_idx = len(task_names_flat) - 1
 
         if isinstance(self.sampler.indices, np.ndarray):
-            self.sampler.indices = self.sampler.indices[self.sampler.indices <= max_valid_idx]
+            # Filter rows where the buffer_end_idx (column 1) is safely within bounds
+            valid_mask = self.sampler.indices[:, 1] <= max_valid_idx
+            self.sampler.indices = self.sampler.indices[valid_mask]
         else:
-            self.sampler.indices = [i for i in self.sampler.indices if i <= max_valid_idx]
+            self.sampler.indices = [row for row in self.sampler.indices if row[1] <= max_valid_idx]
 
         indices = self.sampler.indices   # list of start positions in flat buffer
-        sample_tasks = [task_names_flat[i] for i in indices]
+        sample_tasks = [task_names_flat[row[0]] for row in indices]
 
         counts: dict = {}
         for t in sample_tasks:
