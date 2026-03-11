@@ -118,10 +118,17 @@ class MetaworldDataset(BaseDataset):
         task_name is constant within an episode so reading the first frame is sufficient.
         """
         task_names_flat = np.array([str(x) for x in self.replay_buffer['task_name'][:]])
+        max_valid_idx = len(task_names_flat) - 1
+
+        if isinstance(self.sampler.indices, np.ndarray):
+            self.sampler.indices = self.sampler.indices[self.sampler.indices <= max_valid_idx]
+        else:
+            self.sampler.indices = [i for i in self.sampler.indices if i <= max_valid_idx]
+
         indices = self.sampler.indices   # list of start positions in flat buffer
         sample_tasks = [task_names_flat[i] for i in indices]
 
-        counts = {}
+        counts: dict = {}
         for t in sample_tasks:
             counts[t] = counts.get(t, 0) + 1
         weights = torch.tensor([1.0 / counts[t] for t in sample_tasks], dtype=torch.float)
