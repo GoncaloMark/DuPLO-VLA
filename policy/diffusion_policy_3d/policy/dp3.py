@@ -56,13 +56,16 @@ class DP3(BasePolicy):
         obs_shape_meta = shape_meta['obs']
         obs_dict = dict_apply(obs_shape_meta, lambda x: x['shape'])
 
+        latent_dim = shape_meta['obs'].get('task_latent', {}).get('shape', [512])[0]
+
         obs_encoder = DP3Encoder(observation_space=obs_dict,
                                                    img_crop_shape=crop_shape,
                                                 out_channel=encoder_output_dim,
                                                 pointcloud_encoder_cfg=pointcloud_encoder_cfg,
                                                 use_pc_color=use_pc_color,
                                                 pointnet_type=pointnet_type,
-                                                use_task_conditioning='task_latent' in obs_dict
+                                                use_task_conditioning='task_latent' in obs_dict,
+                                                task_latent_dim=latent_dim
                                                 )
 
         # create diffusion model
@@ -177,7 +180,21 @@ class DP3(BasePolicy):
         result: must include "action" key
         """
         # normalize input
+        task_latent_key = 'task_latent' 
+        task_latent = obs_dict.pop(task_latent_key, None)
+
         nobs = self.normalizer.normalize(obs_dict)
+
+        if task_latent is not None:
+            # Cast bfloat16 to float32 to match PointNet and DP3
+            task_latent = task_latent.to(dtype=torch.float32)
+            
+            # If the latent is [B, 512] but observations are [B, T, ...], expand the time dimension
+            if task_latent.dim() == 2 and 'state' in nobs:
+                B, T = nobs['state'].shape[:2]
+                task_latent = task_latent.unsqueeze(1).expand(B, T, -1)
+                
+            nobs[task_latent_key] = task_latent
         # this_n_point_cloud = nobs['imagin_robot'][..., :3] # only use coordinate
         if not self.use_pc_color:
             nobs['point_cloud'] = nobs['point_cloud'][..., :3]

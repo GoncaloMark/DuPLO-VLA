@@ -292,7 +292,19 @@ class DP3Encoder(nn.Module):
         if self.use_task_conditioning:
             assert self.task_latent_key in observations, \
                 f"Task latent key '{self.task_latent_key}' not found in observations"
-            task_latent = observations[self.task_latent_key]  # B * task_latent_dim
+            task_latent = observations[self.task_latent_key]
+            
+            # Failsafe 1: Ensure exact dtype match for torch.cat
+            task_latent = task_latent.to(dtype=pn_feat.dtype)
+            
+            # Failsafe 2: If DP3 flattened [B, T, D] to [B*T, D] for pn_feat, 
+            # but task_latent is still [B, D], expand and flatten it to match
+            if task_latent.shape[0] != pn_feat.shape[0]:
+                B = task_latent.shape[0]
+                # Calculate how many timesteps were flattened
+                T = pn_feat.shape[0] // B
+                task_latent = task_latent.unsqueeze(1).expand(B, T, -1).reshape(-1, task_latent.shape[-1])
+
             features_to_concat.append(task_latent)
         
         final_feat = torch.cat(features_to_concat, dim=-1)
