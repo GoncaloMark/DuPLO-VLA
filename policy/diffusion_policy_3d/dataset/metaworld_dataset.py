@@ -2,6 +2,7 @@ from typing import Dict
 import torch
 import numpy as np
 import copy
+from tqdm import tqdm 
 from diffusion_policy_3d.common.pytorch_util import dict_apply
 from diffusion_policy_3d.common.replay_buffer import ReplayBuffer
 from diffusion_policy_3d.common.sampler import (
@@ -40,6 +41,9 @@ class MetaworldDataset(BaseDataset):
 
         self.use_precomputed_vlm = use_precomputed_vlm
 
+        # -----------------------------------------------------
+        # 1. Mount the Zarr Dataset (Preserved your S3 logic)
+        # -----------------------------------------------------
         if zarr_path.startswith("s3://"):
             zarr_root = zarr.open_group(
                 store=zarr_path.replace("s3://", ""),
@@ -50,12 +54,41 @@ class MetaworldDataset(BaseDataset):
                     'client_kwargs': {'region_name': "eu-west-2"}
                 },
             )
-            
             self.replay_buffer = ReplayBuffer(root=zarr_root)
-            
         else:
             self.replay_buffer = ReplayBuffer.copy_from_path(zarr_path, keys=keys)
 
+
+        # =====================================================
+        # THE FIX: Chunk-by-Chunk RAM Preload
+        # =====================================================
+        if self.use_precomputed_vlm:
+            print("Safely loading VLM tensors into RAM chunk-by-chunk to avoid memory spikes...")
+            
+            vlm_keys = ['vlm_hidden_states', 'goal_vlm_hidden_states', 'vlm_seq_len', 'goal_vlm_seq_len']
+            for key in vlm_keys:
+                zarr_arr = self.replay_buffer.data[key]
+                print(f"Loading {key} {zarr_arr.shape} into RAM...")
+                
+                # 1. Pre-allocate the pure NumPy array (Zero memory spikes)
+                ram_arr = np.empty(zarr_arr.shape, dtype=zarr_arr.dtype)
+                
+                # 2. Extract from disk to RAM iteratively
+                chunk_size = 500  # Pull 500 frames at a time
+                for i in tqdm(range(0, zarr_arr.shape[0], chunk_size), leave=False):
+                    end = min(i + chunk_size, zarr_arr.shape[0])
+                    ram_arr[i:end] = zarr_arr[i:end]
+                
+                # 3. Swap the slow disk pointer with the fast RAM array!
+                self.replay_buffer.data[key] = ram_arr
+                
+            print("Load complete! The GPU can now feast instantly.")
+        # =====================================================
+
+
+        # -----------------------------------------------------
+        # 2. Setup Sampler & Masks (Preserved your logic)
+        # -----------------------------------------------------
         val_mask   = get_val_mask(
             n_episodes=self.replay_buffer.n_episodes,
             val_ratio=val_ratio,

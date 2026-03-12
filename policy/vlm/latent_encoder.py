@@ -16,6 +16,8 @@ class QPooler(nn.Module):
         self.head_dim    = hidden_dim // num_heads
         assert hidden_dim % num_heads == 0
 
+        self.feature_norm = nn.LayerNorm(hidden_dim)
+
         self.queries = nn.Parameter(torch.empty(num_queries, hidden_dim))
         nn.init.trunc_normal_(self.queries, std=0.02)
 
@@ -35,6 +37,7 @@ class QPooler(nn.Module):
 
     def forward(self, features, key_padding_mask=None):
         B, seq_len, D = features.shape
+        features = self.feature_norm(features)
         queries = self.queries.unsqueeze(0).expand(B, -1, -1)
 
         Q = self.q_proj(queries).view(B, self.num_queries, self.num_heads, self.head_dim).transpose(1, 2)
