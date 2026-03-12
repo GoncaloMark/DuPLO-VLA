@@ -157,7 +157,6 @@ class LatentTaskEncoder(nn.Module):
             nn.Linear(2048, 1024),
             nn.LayerNorm(1024), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(1024, latent_dim),
-            nn.LayerNorm(latent_dim),
         )
 
     def forward(self, vlm_features, vlm_hidden_states=None,
@@ -167,7 +166,9 @@ class LatentTaskEncoder(nn.Module):
                    else vlm_features
 
         pooled, attn_weights = self.q_pooler(features, key_padding_mask=key_padding_mask)
+        
         latent = self.encoder(pooled.view(pooled.shape[0], -1))
+        latent = F.normalize(latent, p=2, dim=-1)
 
         out = {'latent': latent, 'pooled_features': pooled}
         if return_attention_weights:
