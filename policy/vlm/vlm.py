@@ -74,14 +74,18 @@ class VisualTaskPlanner(nn.Module):
                 p.requires_grad = False
 
     def _compute_encoder_loss(self, latent, task_names, episode_ids):
-        """Contrastive Loss Only"""
         contrastive = self.contrastive_loss(latent, task_names, episode_ids)
 
-        
-        loss = self.contrastive_weight * contrastive
-        
+        # Variance regularization: pushes std/dim toward 1.0
+        # Penalizes collapse where all dims have near-zero variance
+        std_per_dim = latent.std(dim=0)  # (D,)
+        var_reg = F.relu(1.0 - std_per_dim).mean()
+
+        loss = self.contrastive_weight * contrastive + LATENT_VAR_REG_WEIGHT * var_reg
+
         return loss, {
             'contrastive': contrastive.item(),
+            'var_reg': var_reg.item(),
         }
 
     def extract_features_batch(self, images, texts, training=False, return_all_layers=True):
