@@ -112,17 +112,35 @@ class HierarchicalContrastiveLoss(nn.Module):
     def forward(self, latents, task_names, episode_ids):
         B = latents.shape[0]
         if B < 2:
-            return torch.tensor(0.0, device=latents.device)
+            return torch.tensor(0.0, device=latents.device, requires_grad=True)
+            
         labels = self._build_labels(task_names, episode_ids, latents.device)
+        
         if labels.sum() == 0:
-            return torch.tensor(0.0, device=latents.device)
+            return latents.sum() * 0.0 
 
-        sim = F.normalize(latents, dim=-1) @ F.normalize(latents, dim=-1).T / self.temperature
-        sim = sim.masked_fill(torch.eye(B, dtype=torch.bool, device=latents.device), -1e9)
-        exp = sim.exp()
-        loss = -torch.log((exp * labels).sum(-1) / (exp.sum(-1) + 1e-8))
-        mask = labels.sum(-1) > 0
-        return loss[mask].mean() if mask.any() else torch.tensor(0.0, device=latents.device)
+        sim = latents @ latents.T / self.temperature
+
+        # Subtract max logit before exp to prevent overflow (classic Softmax trick)
+        logits_max, _ = torch.max(sim, dim=1, keepdim=True)
+        sim_stable = sim - logits_max.detach()
+        exp = sim_stable.exp()
+        
+        # Mask out the diagonal (self-similarity)
+        mask = torch.eye(B, dtype=torch.bool, device=latents.device)
+        exp = exp.masked_fill(mask, 0.0)
+        
+        # Add epsilon to denominator to prevent division by zero (log(0) -> NaN)
+        denom = exp.sum(-1) + 1e-8
+        num = (exp * labels).sum(-1)
+        
+        # Only compute loss for rows that actually HAVE a positive target
+        valid_rows = labels.sum(-1) > 0
+        if not valid_rows.any():
+            return latents.sum() * 0.0
+            
+        loss = -torch.log(num[valid_rows] / denom[valid_rows] + 1e-8)
+        return loss.mean()
 
 
 class LatentTaskEncoder(nn.Module):
