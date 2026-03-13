@@ -174,6 +174,7 @@ class LatentTaskEncoder(nn.Module):
             nn.Linear(2048, 1024),
             nn.LayerNorm(1024), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(1024, latent_dim),
+            nn.LayerNorm(latent_dim)
         )
 
     def forward(self, vlm_features, vlm_hidden_states=None,
