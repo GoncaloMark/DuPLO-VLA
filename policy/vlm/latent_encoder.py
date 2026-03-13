@@ -116,30 +116,29 @@ class HierarchicalContrastiveLoss(nn.Module):
             
         labels = self._build_labels(task_names, episode_ids, latents.device)
         
-        if labels.sum() == 0:
-            return latents.sum() * 0.0 
-
-        sim = latents @ latents.T / self.temperature
-
-        # Subtract max logit before exp to prevent overflow (classic Softmax trick)
-        logits_max, _ = torch.max(sim, dim=1, keepdim=True)
-        sim_stable = sim - logits_max.detach()
-        exp = sim_stable.exp()
-        
-        # Mask out the diagonal (self-similarity)
-        mask = torch.eye(B, dtype=torch.bool, device=latents.device)
-        exp = exp.masked_fill(mask, 0.0)
-        
-        # Add epsilon to denominator to prevent division by zero (log(0) -> NaN)
-        denom = exp.sum(-1) + 1e-8
-        num = (exp * labels).sum(-1)
-        
         # Only compute loss for rows that actually HAVE a positive target
         valid_rows = labels.sum(-1) > 0
         if not valid_rows.any():
-            return latents.sum() * 0.0
-            
-        loss = -torch.log(num[valid_rows] / denom[valid_rows] + 1e-8)
+            return latents.sum() * 0.0 
+
+        # Normalize labels into a target probability distribution!
+        # This fixes the semi-negative bug by creating a proper target distribution.
+        target_probs = labels / (labels.sum(dim=-1, keepdim=True) + 1e-8)
+        
+        # Compute raw similarities
+        sim = latents @ latents.T / self.temperature
+
+        # Mask out the diagonal (self-similarity) by setting it to negative infinity.
+        # This makes the self-similarity mathematically vanish (exp(-inf) = 0) in the softmax.
+        mask = torch.eye(B, dtype=torch.bool, device=latents.device)
+        sim = sim.masked_fill(mask, float('-inf'))
+        
+        # PyTorch's log_softmax safely handles the max-logit stability trick internally
+        log_probs = F.log_softmax(sim, dim=-1)
+        
+        # Soft-label Cross-Entropy: - sum(target * log(pred))
+        loss = - (target_probs[valid_rows] * log_probs[valid_rows]).sum(dim=-1)
+        
         return loss.mean()
 
 

@@ -74,20 +74,14 @@ class VisualTaskPlanner(nn.Module):
                 p.requires_grad = False
 
     def _compute_encoder_loss(self, latent, task_names, episode_ids):
-        """Contrastive + stable variance regularizer."""
+        """Contrastive Loss Only"""
         contrastive = self.contrastive_loss(latent, task_names, episode_ids)
 
-        # Stable Variance Regularization (VICReg style)
-        # Instead of -log(std), we penalize std if it falls below a target (e.g., 1.0)
-        # We use a hinge loss: max(0, 1 - std)
-        std = torch.sqrt(latent.var(dim=0) + 1e-8)
-        var_reg = torch.mean(F.relu(1.0 - std))
-
-        loss = self.contrastive_weight * contrastive + LATENT_VAR_REG_WEIGHT * var_reg
+        
+        loss = self.contrastive_weight * contrastive
         
         return loss, {
             'contrastive': contrastive.item(),
-            'latent_var_reg': var_reg.item(),
         }
 
     def extract_features_batch(self, images, texts, training=False, return_all_layers=True):
