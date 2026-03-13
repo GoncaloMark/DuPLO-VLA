@@ -131,7 +131,7 @@ class HierarchicalContrastiveLoss(nn.Module):
         # Mask out the diagonal (self-similarity) by setting it to negative infinity.
         # This makes the self-similarity mathematically vanish (exp(-inf) = 0) in the softmax.
         mask = torch.eye(B, dtype=torch.bool, device=latents.device)
-        sim = sim.masked_fill(mask, float('-inf'))
+        sim = sim.masked_fill(mask, -1e9)
         
         # PyTorch's log_softmax safely handles the max-logit stability trick internally
         log_probs = F.log_softmax(sim, dim=-1)
