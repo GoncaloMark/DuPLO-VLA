@@ -73,20 +73,14 @@ class VisualTaskPlanner(nn.Module):
             for p in self.vlm.parameters():
                 p.requires_grad = False
 
-    def _compute_encoder_loss(self, latent, task_names, episode_ids):
+    def _compute_encoder_loss(self, latent, raw_latent, task_names, episode_ids):
         contrastive = self.contrastive_loss(latent, task_names, episode_ids)
 
-        # Variance regularization: pushes std/dim toward 1.0
-        # Penalizes collapse where all dims have near-zero variance
-        std_per_dim = latent.std(dim=0)  # (D,)
+        std_per_dim = raw_latent.std(dim=0)
         var_reg = F.relu(1.0 - std_per_dim).mean()
 
         loss = self.contrastive_weight * contrastive + LATENT_VAR_REG_WEIGHT * var_reg
-
-        return loss, {
-            'contrastive': contrastive.item(),
-            'var_reg': var_reg.item(),
-        }
+        return loss, {'contrastive': contrastive.item(), 'var_reg': var_reg.item()}
 
     def extract_features_batch(self, images, texts, training=False, return_all_layers=True):
         if isinstance(images, torch.Tensor):
@@ -157,7 +151,7 @@ class VisualTaskPlanner(nn.Module):
         encoder_loss_dict = None
         if return_encoder_loss and task_names is not None and episode_ids is not None:
             encoder_loss, encoder_loss_dict = self._compute_encoder_loss(
-                latent, task_names, episode_ids
+                latent, enc_out['raw_latent'], task_names, episode_ids
             )
 
         return {
@@ -206,7 +200,9 @@ class VisualTaskPlanner(nn.Module):
         if return_encoder_loss:
             tn = task_names  if task_names  is not None else instructions
             ei = episode_ids if episode_ids is not None else list(range(len(instructions)))
-            encoder_loss, encoder_loss_dict = self._compute_encoder_loss(latent, tn, ei)
+            encoder_loss, encoder_loss_dict = self._compute_encoder_loss(
+                latent, enc_out['raw_latent'], tn, ei
+            )
 
         if not isinstance(instruction, list):
             latent = latent[0]
