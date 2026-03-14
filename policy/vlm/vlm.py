@@ -6,9 +6,11 @@ import numpy as np
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from torch.amp import autocast
 
-from .latent_encoder import HierarchicalContrastiveLoss, LatentTaskEncoder
+from .latent_encoder import TemporalContrastiveLoss, LatentTaskEncoder
 
-LATENT_VAR_REG_WEIGHT = 0.01  # anti-collapse: keeps latent dimensions spread out
+# Anti-collapse: penalizes dimensions with std < 1.0
+# Keeps the latent space spread out even before BC gradients kick in.
+LATENT_VAR_REG_WEIGHT = 1.0
 
 
 class VisualTaskPlanner(nn.Module):
@@ -25,8 +27,8 @@ class VisualTaskPlanner(nn.Module):
         layer_fusion_method: str = "learned_weighted",
         use_multi_layer: bool = True,
         dropout: float = 0.1,
-        contrastive_weight: float = 0.01,
-        contrastive_temperature: float = 0.07,
+        contrastive_weight: float = 1.0,
+        contrastive_temperature: float = 0.1,
     ):
         super().__init__()
 
@@ -41,8 +43,7 @@ class VisualTaskPlanner(nn.Module):
             self.processor = Qwen3VLProcessor.from_pretrained(model_name)
 
         if self.vlm is not None:
-            vlm_hidden_dim = self.vlm.config.text_config.hidden_size 
-            
+            vlm_hidden_dim = self.vlm.config.text_config.hidden_size
         else:
             vlm_hidden_dim = vlm_dim
 
@@ -62,10 +63,8 @@ class VisualTaskPlanner(nn.Module):
         self.use_multi_layer = use_multi_layer
         self.contrastive_weight = contrastive_weight
 
-        self.contrastive_loss = HierarchicalContrastiveLoss(
+        self.contrastive_loss = TemporalContrastiveLoss(
             temperature=contrastive_temperature,
-            same_episode_weight=1.0,
-            same_task_weight=0.5,
         )
 
         if freeze_vlm and load_vlm:
@@ -73,14 +72,29 @@ class VisualTaskPlanner(nn.Module):
             for p in self.vlm.parameters():
                 p.requires_grad = False
 
-    def _compute_encoder_loss(self, latent, raw_latent, task_names, episode_ids):
-        contrastive = self.contrastive_loss(latent, task_names, episode_ids)
+    def _compute_encoder_loss(self, latent_normed, raw_latent, episode_ids):
+        """
+        Encoder-specific losses (contrastive + variance regularization).
 
-        std_per_dim = raw_latent.std(dim=0)
+        Args:
+            latent_normed: (B, D) L2-normalized latents for contrastive loss
+            raw_latent:    (B, D) unnormalized latents for variance regularization
+            episode_ids:   list[int] episode IDs for contrastive pairing
+        """
+        latent_normed_f32 = latent_normed.float()
+        raw_latent_f32 = raw_latent.float()
+
+        contrastive = self.contrastive_loss(latent_normed_f32, episode_ids)
+
+        # Variance regularization: push per-dimension std toward >= 1.0
+        std_per_dim = torch.sqrt(raw_latent_f32.var(dim=0) + 1e-8)
         var_reg = F.relu(1.0 - std_per_dim).mean()
 
         loss = self.contrastive_weight * contrastive + LATENT_VAR_REG_WEIGHT * var_reg
-        return loss, {'contrastive': contrastive.item(), 'var_reg': var_reg.item()}
+        return loss, {
+            'contrastive': contrastive.item(),
+            'var_reg': var_reg.item(),
+        }
 
     def extract_features_batch(self, images, texts, training=False, return_all_layers=True):
         if isinstance(images, torch.Tensor):
@@ -109,7 +123,25 @@ class VisualTaskPlanner(nn.Module):
         with ctx, autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = self.vlm(**inputs, output_hidden_states=True)
 
-        return outputs.hidden_states[-1], (outputs.hidden_states if return_all_layers else None)
+        # Apply the VLM's final RMSNorm to each hidden state layer.
+        # This matches the precomputed dataset which stores post-RMSNorm values.
+        # Without this, the live path would feed [-2000,8000] to the encoder
+        # while the precomputed path feeds [-5,5] — a distribution mismatch.
+        #
+        # Only normalize layers we actually use (last N) to avoid wasting compute
+        # on 36+ layers when we only need the last 2.
+        final_norm = self.vlm.model.norm
+        last_hidden = final_norm(outputs.hidden_states[-1])
+
+        all_hidden = None
+        if return_all_layers:
+            all_hidden = tuple(
+                final_norm(h) for h in outputs.hidden_states[-self.task_encoder.feature_extractor.num_layers_to_use:]
+            ) if self.use_multi_layer else tuple(
+                final_norm(h) for h in outputs.hidden_states
+            )
+
+        return last_hidden, all_hidden
 
     def _encode_hidden_states(self, hs_tensor, seq_len_tensor=None):
         """Shared encode path for precomputed hidden states → latent."""
@@ -133,30 +165,21 @@ class VisualTaskPlanner(nn.Module):
         self,
         vlm_hidden_states: torch.Tensor,
         vlm_seq_len: Optional[torch.Tensor],
-        task_names=None,
         episode_ids=None,
-        goal_hidden_states: Optional[torch.Tensor] = None,
-        goal_seq_len: Optional[torch.Tensor] = None,
         return_encoder_loss: bool = False,
     ) -> dict:
         enc_out, _ = self._encode_hidden_states(vlm_hidden_states, vlm_seq_len)
         latent = enc_out['latent']
 
-        goal_latent = None
-        if goal_hidden_states is not None:
-            goal_enc, _ = self._encode_hidden_states(goal_hidden_states, goal_seq_len)
-            goal_latent = goal_enc['latent']
-
         encoder_loss = None
         encoder_loss_dict = None
-        if return_encoder_loss and task_names is not None and episode_ids is not None:
+        if return_encoder_loss and episode_ids is not None:
             encoder_loss, encoder_loss_dict = self._compute_encoder_loss(
-                latent, enc_out['raw_latent'], task_names, episode_ids
+                enc_out['latent_normed'], latent, episode_ids,
             )
 
         return {
             'latent': latent,
-            'goal_latent': goal_latent,
             'encoder_output': enc_out,
             'encoder_loss': encoder_loss,
             'encoder_loss_dict': encoder_loss_dict,
@@ -166,7 +189,6 @@ class VisualTaskPlanner(nn.Module):
         self,
         image,
         instruction: Union[str, List[str]],
-        task_names=None,
         episode_ids=None,
         training: bool = True,
         return_attention_weights: bool = False,
@@ -198,19 +220,18 @@ class VisualTaskPlanner(nn.Module):
         encoder_loss = None
         encoder_loss_dict = None
         if return_encoder_loss:
-            tn = task_names  if task_names  is not None else instructions
             ei = episode_ids if episode_ids is not None else list(range(len(instructions)))
             encoder_loss, encoder_loss_dict = self._compute_encoder_loss(
-                latent, enc_out['raw_latent'], tn, ei
+                enc_out['latent_normed'], latent, ei,
             )
 
         if not isinstance(instruction, list):
             latent = latent[0]
-            enc_out = {k: v[0] if isinstance(v, torch.Tensor) and v.ndim > 1 else v for k, v in enc_out.items()}
+            enc_out = {k: v[0] if isinstance(v, torch.Tensor) and v.ndim > 1 else v
+                       for k, v in enc_out.items()}
 
         return {
             'latent': latent,
-            'goal_latent': None,
             'encoder_output': enc_out,
             'encoder_loss': encoder_loss,
             'encoder_loss_dict': encoder_loss_dict,

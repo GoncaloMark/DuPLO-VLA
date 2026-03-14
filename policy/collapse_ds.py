@@ -7,7 +7,7 @@ from termcolor import cprint
 # Directory containing individual per-task zarrs
 INPUT_DIR = "../data/"
 
-OUTPUT_ZARR = "../data/metaworld_all_tasks_expert.zarr"
+OUTPUT_ZARR = "../data/metaworld_2_tasks_expert.zarr"
 
 DATA_KEYS = [
     "img",
@@ -74,6 +74,16 @@ def main():
             "episodes": num_episodes,
             "steps": num_steps
         })
+
+    cprint("\nRemapping episode_ids to be globally unique...", "cyan")
+    episode_id_offset = 0
+    for i in range(len(data_acc['episode_id'])):
+        arr = data_acc['episode_id'][i]
+        data_acc['episode_id'][i] = arr + episode_id_offset
+        # Number of unique episodes in this task's chunk
+        episode_id_offset += len(np.unique(arr))
+
+    cprint(f"  Total unique episode IDs: {episode_id_offset}", "green")
 
     # --------------------------------------------------
     # Concatenate

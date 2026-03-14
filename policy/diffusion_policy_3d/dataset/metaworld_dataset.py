@@ -2,7 +2,7 @@ from typing import Dict
 import torch
 import numpy as np
 import copy
-from tqdm import tqdm 
+from tqdm import tqdm
 from diffusion_policy_3d.common.pytorch_util import dict_apply
 from diffusion_policy_3d.common.replay_buffer import ReplayBuffer
 from diffusion_policy_3d.common.sampler import (
@@ -26,7 +26,7 @@ class MetaworldDataset(BaseDataset):
             latent_update_interval=3,
             randomize_update_interval=True,
             use_precomputed_vlm=False,
-            aws_key=None,       
+            aws_key=None,
             aws_secret=None,
             ):
         super().__init__()
@@ -35,14 +35,13 @@ class MetaworldDataset(BaseDataset):
         if use_precomputed_vlm:
             # vlm_hidden_states: (T, num_layers, max_seq_len, hidden_dim) float16
             # vlm_seq_len: (T,) int32  actual token count before zero-padding
-            # goal_vlm_hidden_states: same shape — final frame of the episode
-            # goal_vlm_seq_len: (T,) int32
-            keys += ['vlm_hidden_states', 'vlm_seq_len', 'goal_vlm_hidden_states', 'goal_vlm_seq_len']
+            # REMOVED: goal_vlm_hidden_states, goal_vlm_seq_len (VIP loss dropped)
+            keys += ['vlm_hidden_states', 'vlm_seq_len']
 
         self.use_precomputed_vlm = use_precomputed_vlm
 
         # -----------------------------------------------------
-        # 1. Mount the Zarr Dataset (Preserved your S3 logic)
+        # 1. Mount the Zarr Dataset
         # -----------------------------------------------------
         if zarr_path.startswith("s3://"):
             zarr_root = zarr.open_group(
@@ -60,34 +59,31 @@ class MetaworldDataset(BaseDataset):
 
 
         # =====================================================
-        # THE FIX: Chunk-by-Chunk RAM Preload
+        # Chunk-by-Chunk RAM Preload (no goal states needed)
         # =====================================================
         if self.use_precomputed_vlm:
-            print("Safely loading VLM tensors into RAM chunk-by-chunk to avoid memory spikes...")
-            
-            vlm_keys = ['vlm_hidden_states', 'goal_vlm_hidden_states', 'vlm_seq_len', 'goal_vlm_seq_len']
+            print("Loading VLM tensors into RAM chunk-by-chunk...")
+
+            vlm_keys = ['vlm_hidden_states', 'vlm_seq_len']
             for key in vlm_keys:
                 zarr_arr = self.replay_buffer.data[key]
                 print(f"Loading {key} {zarr_arr.shape} into RAM...")
-                
-                # 1. Pre-allocate the pure NumPy array (Zero memory spikes)
+
                 ram_arr = np.empty(zarr_arr.shape, dtype=zarr_arr.dtype)
-                
-                # 2. Extract from disk to RAM iteratively
-                chunk_size = 500  # Pull 500 frames at a time
+
+                chunk_size = 500
                 for i in tqdm(range(0, zarr_arr.shape[0], chunk_size), leave=False):
                     end = min(i + chunk_size, zarr_arr.shape[0])
                     ram_arr[i:end] = zarr_arr[i:end]
-                
-                # 3. Swap the slow disk pointer with the fast RAM array!
+
                 self.replay_buffer.data[key] = ram_arr
-                
-            print("Load complete! The GPU can now feast instantly.")
+
+            print("VLM load complete.")
         # =====================================================
 
 
         # -----------------------------------------------------
-        # 2. Setup Sampler & Masks (Preserved your logic)
+        # 2. Setup Sampler & Masks
         # -----------------------------------------------------
         val_mask   = get_val_mask(
             n_episodes=self.replay_buffer.n_episodes,
@@ -147,20 +143,17 @@ class MetaworldDataset(BaseDataset):
         """
         Inverse-frequency weights per sample for WeightedRandomSampler.
         Gives each task equal expected representation regardless of episode count.
-        SequenceSampler.indices contains the flat-buffer start index for each sample;
-        task_name is constant within an episode so reading the first frame is sufficient.
         """
         task_names_flat = np.array([str(x) for x in self.replay_buffer['task_name'][:]])
         max_valid_idx = len(task_names_flat) - 1
 
         if isinstance(self.sampler.indices, np.ndarray):
-            # Filter rows where the buffer_end_idx (column 1) is safely within bounds
             valid_mask = self.sampler.indices[:, 1] <= max_valid_idx
             self.sampler.indices = self.sampler.indices[valid_mask]
         else:
             self.sampler.indices = [row for row in self.sampler.indices if row[1] <= max_valid_idx]
 
-        indices = self.sampler.indices   # list of start positions in flat buffer
+        indices = self.sampler.indices
         sample_tasks = [task_names_flat[row[0]] for row in indices]
 
         counts: dict = {}
@@ -197,8 +190,6 @@ class MetaworldDataset(BaseDataset):
         if self.use_precomputed_vlm:
             obs['vlm_hidden_states'] = sample['vlm_hidden_states'].astype(np.float16)
             obs['vlm_seq_len'] = sample['vlm_seq_len'].astype(np.int32)
-            obs['goal_vlm_hidden_states'] = sample['goal_vlm_hidden_states'].astype(np.float16)
-            obs['goal_vlm_seq_len'] = sample['goal_vlm_seq_len'].astype(np.int32)
 
         return {'obs': obs, 'action': sample['action'].astype(np.float32)}
 

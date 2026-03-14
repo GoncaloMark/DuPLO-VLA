@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class QPooler(nn.Module):
     """
     Cross-attention bottleneck (Perceiver/Flamingo style).
@@ -90,66 +91,68 @@ class MultiLayerFeatureExtractor(nn.Module):
             return self.fusion_proj(torch.cat(selected, dim=-1))
 
 
-class HierarchicalContrastiveLoss(nn.Module):
-    """Same episode -> 1.0, same task diff episode -> 0.5, different task -> 0.0"""
-    def __init__(self, temperature=0.07, same_episode_weight=1.0, same_task_weight=0.5):
+class TemporalContrastiveLoss(nn.Module):
+    """
+    Temporal InfoNCE: within-episode nearby frames are positives,
+    cross-episode frames are negatives.
+
+    This replaces HierarchicalContrastiveLoss. The key advantage is that it
+    provides rich *within-episode* structure (the encoder must track progress
+    through a task), not just a binary task-ID signal.
+
+    Requires: episode_ids to determine which samples share an episode.
+    Optionally uses temporal_indices to weight positives by proximity.
+    """
+    def __init__(self, temperature=0.1):
         super().__init__()
-        self.temperature         = temperature
-        self.same_episode_weight = same_episode_weight
-        self.same_task_weight    = same_task_weight
+        self.temperature = temperature
 
-    def _build_labels(self, task_names, episode_ids, device):
-        task_hashes = torch.tensor([hash(t) for t in task_names], device=device)
-        ep_ids = torch.tensor(episode_ids, device=device)
-        same_task = task_hashes.unsqueeze(0) == task_hashes.unsqueeze(1)
-        same_ep = ep_ids.unsqueeze(0) == ep_ids.unsqueeze(1)
-        labels = torch.zeros(len(task_names), len(task_names), device=device)
-        labels[same_task] = self.same_task_weight
-        labels[same_ep]   = self.same_episode_weight
-        labels.fill_diagonal_(0.0)
-        return labels
-
-    def forward(self, latents, task_names, episode_ids):
+    def forward(self, latents, episode_ids, temporal_indices=None):
+        """
+        Args:
+            latents:          (B, D) L2-normalized embeddings
+            episode_ids:      list[int] length B
+            temporal_indices: optional list[int] length B, timestep within episode
+        """
         B = latents.shape[0]
         if B < 2:
             return torch.tensor(0.0, device=latents.device, requires_grad=True)
-            
-        labels = self._build_labels(task_names, episode_ids, latents.device)
-        
-        # Only compute loss for rows that actually HAVE a positive target
-        valid_rows = labels.sum(-1) > 0
+
+        device = latents.device
+        ep_ids = torch.tensor(episode_ids, device=device)
+
+        # Same-episode mask (excluding diagonal)
+        same_ep = ep_ids.unsqueeze(0) == ep_ids.unsqueeze(1)  # (B, B)
+        diag = torch.eye(B, dtype=torch.bool, device=device)
+        positives = same_ep & ~diag
+
+        # Need at least one positive pair somewhere
+        valid_rows = positives.any(dim=1)
         if not valid_rows.any():
-            return latents.sum() * 0.0 
+            return latents.sum() * 0.0
 
-        # Normalize labels into a target probability distribution!
-        # This fixes the semi-negative bug by creating a proper target distribution.
-        target_probs = labels / (labels.sum(dim=-1, keepdim=True) + 1e-8)
-        
-        # Compute raw similarities
+        # Cosine similarity (latents should already be L2-normed)
         sim = latents @ latents.T / self.temperature
+        sim = sim.masked_fill(diag, -1e9)
 
-        # Mask out the diagonal (self-similarity) by setting it to negative infinity.
-        # This makes the self-similarity mathematically vanish (exp(-inf) = 0) in the softmax.
-        mask = torch.eye(B, dtype=torch.bool, device=latents.device)
-        sim = sim.masked_fill(mask, -1e9)
-        
-        # PyTorch's log_softmax safely handles the max-logit stability trick internally
         log_probs = F.log_softmax(sim, dim=-1)
-        
-        # Soft-label Cross-Entropy: - sum(target * log(pred))
-        loss = - (target_probs[valid_rows] * log_probs[valid_rows]).sum(dim=-1)
-        
+
+        # Uniform weight across all positives for each anchor
+        pos_counts = positives.float().sum(dim=-1, keepdim=True).clamp(min=1.0)
+        target = positives.float() / pos_counts
+
+        loss = -(target[valid_rows] * log_probs[valid_rows]).sum(dim=-1)
         return loss.mean()
 
 
 class LatentTaskEncoder(nn.Module):
     """
     Q-Pooler + MLP encoder.
-    Reconstruction heads removed — contrastive + VIP goal carry all the supervision.
     """
     def __init__(self, vlm_hidden_dim, latent_dim=512, num_pooling_queries=8,
                  num_attention_heads=8, num_vlm_layers_to_use=4,
-                 layer_fusion_method="learned_weighted", use_multi_layer=True, dropout=0.1):
+                 layer_fusion_method="learned_weighted", use_multi_layer=True,
+                 dropout=0.1):
         super().__init__()
         self.latent_dim = latent_dim
         self.use_multi_layer = use_multi_layer
@@ -174,44 +177,27 @@ class LatentTaskEncoder(nn.Module):
             nn.Linear(2048, 1024),
             nn.LayerNorm(1024), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(1024, latent_dim),
-            nn.LayerNorm(latent_dim)
+            nn.LayerNorm(latent_dim),
         )
 
-    def forward(self, vlm_features, vlm_hidden_states=None, return_attention_weights=False, key_padding_mask=None):
+    def forward(self, vlm_features, vlm_hidden_states=None,
+                return_attention_weights=False, key_padding_mask=None):
         features = self.feature_extractor(vlm_hidden_states) \
                 if (self.use_multi_layer and vlm_hidden_states is not None) \
                 else vlm_features
 
         pooled, attn_weights = self.q_pooler(features, key_padding_mask=key_padding_mask)
-        
-        raw_latent = self.encoder(pooled.view(pooled.shape[0], -1)) 
-        latent = F.normalize(raw_latent, p=2, dim=-1)
 
-        out = {'latent': latent, 'raw_latent': raw_latent, 'pooled_features': pooled}  
+        latent = self.encoder(pooled.view(pooled.shape[0], -1))
+
+        # L2-normalized version for contrastive loss only
+        latent_normed = F.normalize(latent, dim=-1)
+
+        out = {
+            'latent': latent,               # for policy conditioning (full magnitude)
+            'latent_normed': latent_normed,  # for contrastive loss (unit sphere)
+            'pooled_features': pooled,
+        }
         if return_attention_weights:
             out['attention_weights'] = attn_weights
         return out
-
-
-class VIPGoalLoss(nn.Module):
-    """
-    VIP-style monotonic progress: penalize only when distance to goal increases.
-
-    Collapse fix: cosine goal loss + temporal consistency both zero if z is constant.
-    VIP avoids this, a constant z still satisfies the constraint (d_t == d_{t+1},
-    relu(0)=0), but then contrastive loss forces task separation, breaking the constant.
-    Together they can't conspire to collapse.
-
-    At non-update timesteps z_t == z_{t+1} so d_t == d_{t+1}, loss = 0. Only fires
-    when the latent actually updates, exactly where we want the constraint.
-    """
-    def __init__(self, weight=0.1):
-        super().__init__()
-        self.weight = weight
-
-    def forward(self, latents, goal_latents):
-        # latents: (B, T, D),  goal_latents: (B, D)
-        dists      = torch.norm(latents - goal_latents.unsqueeze(1), dim=-1)  # (B, T)
-        violations = F.relu(dists[:, :-1] - dists[:, 1:])
-        loss       = self.weight * violations.mean()
-        return loss, {'vip_goal_loss': violations.mean().item()}
