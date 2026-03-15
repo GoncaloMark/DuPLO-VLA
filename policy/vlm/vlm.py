@@ -130,7 +130,7 @@ class VisualTaskPlanner(nn.Module):
         #
         # Only normalize layers we actually use (last N) to avoid wasting compute
         # on 36+ layers when we only need the last 2.
-        final_norm = self.vlm.model.norm
+        final_norm = self.vlm.model.language_model.norm
         last_hidden = final_norm(outputs.hidden_states[-1])
 
         all_hidden = None
