@@ -64,6 +64,9 @@ else
     echo "  MuJoCo already at ${MUJOCO_DIR}/mujoco210"
 fi
 
+module load anaconda
+conda install -c conda-forge mesalib -y
+
 # Set environment variables
 export MUJOCO_PY_MUJOCO_PATH="${MUJOCO_DIR}/mujoco210"
 export LD_LIBRARY_PATH="${MUJOCO_DIR}/mujoco210/bin:${LD_LIBRARY_PATH}"
