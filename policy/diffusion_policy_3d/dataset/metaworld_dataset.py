@@ -31,17 +31,16 @@ class MetaworldDataset(BaseDataset):
             ):
         super().__init__()
 
-        keys = ['state', 'action', 'point_cloud', 'instruction', 'task_name', 'episode_id', 'img']
-        if use_precomputed_vlm:
-            # vlm_hidden_states: (T, num_layers, max_seq_len, hidden_dim) float16
-            # vlm_seq_len: (T,) int32  actual token count before zero-padding
-            # REMOVED: goal_vlm_hidden_states, goal_vlm_seq_len (VIP loss dropped)
-            keys += ['vlm_hidden_states', 'vlm_seq_len']
+        # Small arrays go into RAM. VLM hidden states stay on disk.
+        ram_keys = ['state', 'action', 'point_cloud', 'instruction',
+                    'task_name', 'episode_id', 'img']
 
         self.use_precomputed_vlm = use_precomputed_vlm
+        self._vlm_hs = None
+        self._vlm_sl = None
 
         # -----------------------------------------------------
-        # 1. Mount the Zarr Dataset
+        # 1. Load small arrays into RAM via ReplayBuffer
         # -----------------------------------------------------
         if zarr_path.startswith("s3://"):
             zarr_root = zarr.open_group(
@@ -55,13 +54,22 @@ class MetaworldDataset(BaseDataset):
             )
             self.replay_buffer = ReplayBuffer(root=zarr_root)
         else:
-            self.replay_buffer = ReplayBuffer.copy_from_path(zarr_path, keys=keys)
-
+            self.replay_buffer = ReplayBuffer.copy_from_path(zarr_path, keys=ram_keys)
 
         # -----------------------------------------------------
-        # 2. Setup Sampler & Masks
+        # 2. Open VLM arrays lazily on disk (not loaded into RAM)
         # -----------------------------------------------------
-        val_mask   = get_val_mask(
+        if use_precomputed_vlm:
+            vlm_zarr = zarr.open(zarr_path, mode='r')
+            self._vlm_hs = vlm_zarr['data/vlm_hidden_states']  # lazy, reads on access
+            self._vlm_sl = vlm_zarr['data/vlm_seq_len']
+            print(f"VLM features on disk (lazy): hs={self._vlm_hs.shape}, sl={self._vlm_sl.shape}")
+            print(f"  RAM saved: ~{self._vlm_hs.nbytes / 1e9:.1f} GB kept on NVMe instead of RAM")
+
+        # -----------------------------------------------------
+        # 3. Setup Sampler & Masks
+        # -----------------------------------------------------
+        val_mask = get_val_mask(
             n_episodes=self.replay_buffer.n_episodes,
             val_ratio=val_ratio,
             seed=seed)
@@ -145,6 +153,41 @@ class MetaworldDataset(BaseDataset):
             value = value[0]
         return str(value)
 
+    def _load_vlm_sequence(self, idx):
+        """
+        Load VLM hidden states lazily from disk for a single sample,
+        replicating the same padding logic as SequenceSampler.sample_sequence.
+
+        Returns:
+            vlm_hs: (horizon, num_layers, max_seq_len, hidden_dim) float16
+            vlm_sl: (horizon,) int32
+        """
+        buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx \
+            = self.sampler.indices[idx]
+
+        # Read only the needed frames from disk
+        hs_slice = self._vlm_hs[buffer_start_idx:buffer_end_idx]  # (n, layers, seq, dim)
+        sl_slice = self._vlm_sl[buffer_start_idx:buffer_end_idx]  # (n,)
+
+        # Apply same padding as SequenceSampler
+        if (sample_start_idx > 0) or (sample_end_idx < self.horizon):
+            hs_padded = np.zeros(
+                (self.horizon,) + hs_slice.shape[1:], dtype=hs_slice.dtype)
+            sl_padded = np.zeros(self.horizon, dtype=sl_slice.dtype)
+
+            if sample_start_idx > 0:
+                hs_padded[:sample_start_idx] = hs_slice[0]
+                sl_padded[:sample_start_idx] = sl_slice[0]
+            if sample_end_idx < self.horizon:
+                hs_padded[sample_end_idx:] = hs_slice[-1]
+                sl_padded[sample_end_idx:] = sl_slice[-1]
+
+            hs_padded[sample_start_idx:sample_end_idx] = hs_slice
+            sl_padded[sample_start_idx:sample_end_idx] = sl_slice
+            return hs_padded, sl_padded
+        else:
+            return np.asarray(hs_slice), np.asarray(sl_slice)
+
     def _sample_to_data(self, sample):
         agent_pos = sample['state'].astype(np.float32)
         point_cloud = sample['point_cloud'].astype(np.float32)
@@ -162,10 +205,6 @@ class MetaworldDataset(BaseDataset):
             'rgb_image': rgb_image,
             'episode_id': episode_id,
         }
-
-        if self.use_precomputed_vlm:
-            obs['vlm_hidden_states'] = sample['vlm_hidden_states'].astype(np.float16)
-            obs['vlm_seq_len'] = sample['vlm_seq_len'].astype(np.int32)
 
         return {'obs': obs, 'action': sample['action'].astype(np.float32)}
 
@@ -186,6 +225,11 @@ class MetaworldDataset(BaseDataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.sampler.sample_sequence(idx)
         data   = self._sample_to_data(sample)
+
+        if self.use_precomputed_vlm:
+            vlm_hs, vlm_sl = self._load_vlm_sequence(idx)
+            data['obs']['vlm_hidden_states'] = vlm_hs.astype(np.float16)
+            data['obs']['vlm_seq_len'] = vlm_sl.astype(np.int32)
 
         latent_update_mask, latent_group_id = self._create_latent_update_schedule(self.horizon)
 
