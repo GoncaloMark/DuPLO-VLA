@@ -64,16 +64,16 @@ else
     echo "  MuJoCo already at ${MUJOCO_DIR}/mujoco210"
 fi
 
-module load anaconda
-conda install -c conda-forge mesalib -y
+# module load anaconda3
+# conda install -c conda-forge mesalib -y
 
 # Set environment variables
 export MUJOCO_PY_MUJOCO_PATH="${MUJOCO_DIR}/mujoco210"
 export LD_LIBRARY_PATH="${MUJOCO_DIR}/mujoco210/bin:${LD_LIBRARY_PATH}"
 export MUJOCO_GL=osmesa
-export C_INCLUDE_PATH="${CONDA_PREFIX}/include:${C_INCLUDE_PATH}"
-export LIBRARY_PATH="${CONDA_PREFIX}/lib:${LIBRARY_PATH}"
-export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
+# export C_INCLUDE_PATH="${CONDA_PREFIX}/include:${C_INCLUDE_PATH}"
+# export LIBRARY_PATH="${CONDA_PREFIX}/lib:${LIBRARY_PATH}"
+# export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
 
 echo "  Installing mujoco-py..."
 pip install "numpy<2.0"
@@ -83,15 +83,14 @@ python -c "import mujoco_py"  # compiles against numpy 1.x headers
 pip install "numpy>=2.0"      # upgrade back, compiled .so still works
 
 # Trigger compilation
-echo "  Triggering mujoco-py compilation (this takes a minute)..."
-python -c "import mujoco_py" 2>&1 || true
-python -c "import mujoco_py; print('  mujoco-py OK')"
+# echo "  Triggering mujoco-py compilation (this takes a minute)..."
+# python -c "import mujoco_py" 2>&1 || true
+# python -c "import mujoco_py; print('  mujoco-py OK')"
 
 echo ""
 echo "Installing MetaWorld..."
 cd Metaworld && pip install -e . && cd ..
 
-# ── 7. Install project dependencies ─────────────────────────
 echo ""
 echo "Installing project dependencies..."
 pip install "zarr<3.0.0" wandb ipdb gpustat dm_control omegaconf hydra-core dill einops \
