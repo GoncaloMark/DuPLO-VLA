@@ -84,7 +84,7 @@ cd Metaworld && pip install -e . && cd ..
 # ── 7. Install project dependencies ─────────────────────────
 echo ""
 echo "Installing project dependencies..."
-pip install zarr wandb ipdb gpustat dm_control omegaconf hydra-core dill einops \
+pip install "zarr<3.0.0" wandb ipdb gpustat dm_control omegaconf hydra-core dill einops \
     diffusers numba moviepy imageio av matplotlib termcolor transformers \
     imageio-ffmpeg
 
