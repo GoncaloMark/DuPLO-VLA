@@ -52,6 +52,8 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 echo ""
 echo "Setting up MuJoCo..."
 
+pip install "cython<3.0"
+
 MUJOCO_DIR="$HOME/.mujoco"
 if [ ! -d "${MUJOCO_DIR}/mujoco210" ]; then
     echo "  Downloading MuJoCo 2.1.0..."
