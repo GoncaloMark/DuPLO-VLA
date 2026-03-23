@@ -10,7 +10,6 @@ from diffusion_policy_3d.common.sampler import (
 from diffusion_policy_3d.model.common.normalizer import LinearNormalizer
 from diffusion_policy_3d.dataset.base_dataset import BaseDataset
 
-import gc
 import zarr
 
 
@@ -209,7 +208,6 @@ class MetaworldDataset(BaseDataset):
         return latent_update_mask, latent_group_id
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        gc.collect()
         sample = self.sampler.sample_sequence(idx)
         data   = self._sample_to_data(sample)
 
