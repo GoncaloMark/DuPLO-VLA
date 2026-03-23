@@ -58,30 +58,6 @@ class MetaworldDataset(BaseDataset):
             self.replay_buffer = ReplayBuffer.copy_from_path(zarr_path, keys=keys)
 
 
-        # =====================================================
-        # Chunk-by-Chunk RAM Preload (no goal states needed)
-        # =====================================================
-        if self.use_precomputed_vlm:
-            print("Loading VLM tensors into RAM chunk-by-chunk...")
-
-            vlm_keys = ['vlm_hidden_states', 'vlm_seq_len']
-            for key in vlm_keys:
-                zarr_arr = self.replay_buffer.data[key]
-                print(f"Loading {key} {zarr_arr.shape} into RAM...")
-
-                ram_arr = np.empty(zarr_arr.shape, dtype=zarr_arr.dtype)
-
-                chunk_size = 500
-                for i in tqdm(range(0, zarr_arr.shape[0], chunk_size), leave=False):
-                    end = min(i + chunk_size, zarr_arr.shape[0])
-                    ram_arr[i:end] = zarr_arr[i:end]
-
-                self.replay_buffer.data[key] = ram_arr
-
-            print("VLM load complete.")
-        # =====================================================
-
-
         # -----------------------------------------------------
         # 2. Setup Sampler & Masks
         # -----------------------------------------------------
