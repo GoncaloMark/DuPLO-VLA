@@ -52,8 +52,6 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 echo ""
 echo "Setting up MuJoCo..."
 
-pip install "cython<3.0"
-
 MUJOCO_DIR="$HOME/.mujoco"
 if [ ! -d "${MUJOCO_DIR}/mujoco210" ]; then
     echo "  Downloading MuJoCo 2.1.0..."
@@ -72,7 +70,12 @@ export LD_LIBRARY_PATH="${MUJOCO_DIR}/mujoco210/bin:${LD_LIBRARY_PATH}"
 export MUJOCO_GL=egl
 
 echo "  Installing mujoco-py..."
+pip install "numpy<2.0"
+pip install "cython<3.0"
 pip install mujoco-py==2.1.2.14
+rm -rf $VENV_DIR/lib/python3.10/site-packages/mujoco_py/generated/
+python -c "import mujoco_py"  # compiles against numpy 1.x headers
+pip install "numpy>=2.0"      # upgrade back, compiled .so still works
 
 # Trigger compilation
 echo "  Triggering mujoco-py compilation (this takes a minute)..."
