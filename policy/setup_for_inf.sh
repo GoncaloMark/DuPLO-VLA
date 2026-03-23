@@ -73,7 +73,6 @@ echo "  Installing mujoco-py..."
 pip install "numpy<2.0"
 pip install "cython<3.0"
 pip install mujoco-py==2.1.2.14
-rm -rf $VENV_DIR/lib/python3.10/site-packages/mujoco_py/generated/
 python -c "import mujoco_py"  # compiles against numpy 1.x headers
 pip install "numpy>=2.0"      # upgrade back, compiled .so still works
 
