@@ -67,7 +67,10 @@ fi
 # Set environment variables
 export MUJOCO_PY_MUJOCO_PATH="${MUJOCO_DIR}/mujoco210"
 export LD_LIBRARY_PATH="${MUJOCO_DIR}/mujoco210/bin:${LD_LIBRARY_PATH}"
-export MUJOCO_GL=egl
+export MUJOCO_GL=osmesa
+export C_INCLUDE_PATH="${CONDA_PREFIX}/include:${C_INCLUDE_PATH}"
+export LIBRARY_PATH="${CONDA_PREFIX}/lib:${LIBRARY_PATH}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
 
 echo "  Installing mujoco-py..."
 pip install "numpy<2.0"
