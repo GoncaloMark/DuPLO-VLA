@@ -30,8 +30,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "policy", "diffusion_policy_3d"))
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from vlm.vlm import VisualTaskPlanner
 from diffusion_policy_3d.policy.dp3 import DP3
-from diffusion_policy_3d.gym_util.metaworld_wrapper import MetaWorldEnv
-from diffusion_policy_3d.model.common.normalizer import LinearNormalizer
+from diffusion_policy_3d.env.metaworld.metaworld_wrapper import MetaWorldEnv
 from helpers import ConfigWrapper, prepare_meta
 
 TASK_INSTRUCTIONS = {
@@ -167,7 +166,7 @@ def compute_latent(planner, rgb_image, instruction, device):
 
 @torch.no_grad()
 def run_episode(planner, policy, env, instruction, device,
-                n_obs_steps=2, n_action_steps=8, max_steps=200,
+                n_obs_steps=2, max_steps=200,
                 latent_update_interval=3):
     """
     Run a single evaluation episode.
