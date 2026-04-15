@@ -334,7 +334,6 @@ def evaluate(args):
                 instruction=instruction,
                 device=device,
                 n_obs_steps=2,
-                n_action_steps=8,
                 max_steps=200,
                 latent_update_interval=3,
             )
