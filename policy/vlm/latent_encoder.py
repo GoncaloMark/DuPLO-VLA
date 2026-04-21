@@ -172,7 +172,7 @@ class LatentTaskEncoder(nn.Module):
         )
 
         self.encoder = nn.Sequential(
-            nn.Linear(vlm_hidden_dim * num_pooling_queries, 2048),
+            nn.Linear(vlm_hidden_dim, 2048),
             nn.LayerNorm(2048), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(2048, 1024),
             nn.LayerNorm(1024), nn.GELU(), nn.Dropout(dropout),
@@ -188,7 +188,8 @@ class LatentTaskEncoder(nn.Module):
 
         pooled, attn_weights = self.q_pooler(features, key_padding_mask=key_padding_mask)
 
-        latent = self.encoder(pooled.view(pooled.shape[0], -1))
+        pooled_mean = pooled.mean(dim=1)  # (B, 2560)
+        latent = self.encoder(pooled_mean)
 
         # L2-normalized version for contrastive loss only
         latent_normed = F.normalize(latent, dim=-1)

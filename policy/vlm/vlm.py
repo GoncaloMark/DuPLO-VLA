@@ -11,6 +11,23 @@ from .latent_encoder import TemporalContrastiveLoss, LatentTaskEncoder
 # Anti-collapse: penalizes dimensions with std < 1.0
 # Keeps the latent space spread out even before BC gradients kick in.
 LATENT_VAR_REG_WEIGHT = 1.0
+LATENT_COV_REG_WEIGHT = 1.0
+
+def vicreg_loss(latent, eps=1e-4):
+    """VICReg variance + covariance terms."""
+    z = latent - latent.mean(dim=0, keepdim=True)
+
+    # Variance: each dim's std should be >= 1
+    std = torch.sqrt(z.var(dim=0) + eps)
+    var_loss = F.relu(1.0 - std).mean()
+
+    # Covariance: off-diagonal entries of cov matrix should be 0
+    D = z.shape[1]
+    cov = (z.T @ z) / (z.shape[0] - 1)
+    off_diag = cov - torch.diag(torch.diagonal(cov))
+    cov_loss = off_diag.pow(2).sum() / D
+
+    return var_loss, cov_loss
 
 
 class VisualTaskPlanner(nn.Module):
@@ -73,27 +90,21 @@ class VisualTaskPlanner(nn.Module):
                 p.requires_grad = False
 
     def _compute_encoder_loss(self, latent_normed, raw_latent, episode_ids):
-        """
-        Encoder-specific losses (contrastive + variance regularization).
-
-        Args:
-            latent_normed: (B, D) L2-normalized latents for contrastive loss
-            raw_latent:    (B, D) unnormalized latents for variance regularization
-            episode_ids:   list[int] episode IDs for contrastive pairing
-        """
         latent_normed_f32 = latent_normed.float()
         raw_latent_f32 = raw_latent.float()
 
         contrastive = self.contrastive_loss(latent_normed_f32, episode_ids)
+        var_loss, cov_loss = vicreg_loss(raw_latent_f32)
 
-        # Variance regularization: push per-dimension std toward >= 1.0
-        std_per_dim = torch.sqrt(raw_latent_f32.var(dim=0) + 1e-8)
-        var_reg = F.relu(1.0 - std_per_dim).mean()
-
-        loss = self.contrastive_weight * contrastive + LATENT_VAR_REG_WEIGHT * var_reg
+        loss = (
+            self.contrastive_weight * contrastive
+            + LATENT_VAR_REG_WEIGHT * var_loss
+            + LATENT_COV_REG_WEIGHT * cov_loss
+        )
         return loss, {
             'contrastive': contrastive.item(),
-            'var_reg': var_reg.item(),
+            'var_reg': var_loss.item(),
+            'cov_reg': cov_loss.item(),
         }
 
     def extract_features_batch(self, images, texts, training=False, return_all_layers=True):

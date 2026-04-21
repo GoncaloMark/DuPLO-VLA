@@ -62,7 +62,7 @@ class MetaworldDataset(BaseDataset):
             self._vlm_sl = vlm_zarr['data/vlm_seq_len'][:]         # ← add [:]
             self._vlm_hs.flags.writeable = False   # ← add this
             self._vlm_sl.flags.writeable = False   # ← add this
-            print(f"VLM features EAGERLY loaded into RAM: hs={self._vlm_hs.shape}, sl={self._vlm_sl.shape}")
+            print(f"VLM features loaded into RAM (read-only): hs={self._vlm_hs.shape}")
             print(f"  RAM used: ~{self._vlm_hs.nbytes / 1e9:.1f} GB")
 
         # -----------------------------------------------------
@@ -121,29 +121,6 @@ class MetaworldDataset(BaseDataset):
 
     def __len__(self) -> int:
         return len(self.sampler)
-
-    def get_sample_weights(self) -> torch.Tensor:
-        """
-        Inverse-frequency weights per sample for WeightedRandomSampler.
-        Gives each task equal expected representation regardless of episode count.
-        """
-        task_names_flat = np.array([str(x) for x in self.replay_buffer['task_name'][:]])
-        max_valid_idx = len(task_names_flat) - 1
-
-        if isinstance(self.sampler.indices, np.ndarray):
-            valid_mask = self.sampler.indices[:, 1] <= max_valid_idx
-            self.sampler.indices = self.sampler.indices[valid_mask]
-        else:
-            self.sampler.indices = [row for row in self.sampler.indices if row[1] <= max_valid_idx]
-
-        indices = self.sampler.indices
-        sample_tasks = [task_names_flat[row[0]] for row in indices]
-
-        counts: dict = {}
-        for t in sample_tasks:
-            counts[t] = counts.get(t, 0) + 1
-        weights = torch.tensor([1.0 / counts[t] for t in sample_tasks], dtype=torch.float)
-        return weights
 
     def _extract_scalar_string(self, value) -> str:
         if isinstance(value, np.ndarray):
