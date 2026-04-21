@@ -73,6 +73,19 @@ class MetaworldDataset(BaseDataset):
         self.replay_buffer.data['instruction'] = inst_ids
         self.replay_buffer.data['task_name'] = task_ids
 
+        if use_precomputed_vlm:
+            vlm_zarr = zarr.open(zarr_path, mode='r')
+            
+            print("Loading 39GB VLM into Shared RAM...")
+            # 1. Load fully into RAM (notice the [:])
+            self._vlm_hs = vlm_zarr['data/vlm_hidden_states'][:]
+            self._vlm_sl = vlm_zarr['data/vlm_seq_len'][:]
+            
+            # 2. Lock them to explicitly prevent CoW duplication
+            self._vlm_hs.flags.writeable = False   
+            self._vlm_sl.flags.writeable = False   
+            print("VLM Loaded and Locked.")
+
         # NOTE: We DO NOT open the VLM zarr here anymore. 
         # Opening it here causes the num_workers deadlock.
 
@@ -106,16 +119,6 @@ class MetaworldDataset(BaseDataset):
         self.latent_update_interval = latent_update_interval
         self.randomize_update_interval = randomize_update_interval
         self.rng = np.random.RandomState(seed)
-
-    def _init_zarr_worker(self):
-        """
-        Lazy-loads the Zarr pointers on the first call by each DataLoader worker.
-        This prevents file handle locks and multiprocessing deadlocks.
-        """
-        if self.use_precomputed_vlm and self._vlm_hs is None:
-            vlm_zarr = zarr.open(self.zarr_path, mode='r')
-            self._vlm_hs = vlm_zarr['data/vlm_hidden_states']
-            self._vlm_sl = vlm_zarr['data/vlm_seq_len']
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
@@ -218,9 +221,6 @@ class MetaworldDataset(BaseDataset):
         return latent_update_mask, latent_group_id
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        # 1. Initialize Zarr pointer cleanly for this specific worker process
-        self._init_zarr_worker()
-
         # 2. Proceed as normal
         sample = self.sampler.sample_sequence(idx)
         data   = self._sample_to_data(sample)
