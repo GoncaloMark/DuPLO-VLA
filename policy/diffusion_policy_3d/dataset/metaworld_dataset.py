@@ -61,10 +61,10 @@ class MetaworldDataset(BaseDataset):
         # -----------------------------------------------------
         if use_precomputed_vlm:
             vlm_zarr = zarr.open(zarr_path, mode='r')
-            self._vlm_hs = vlm_zarr['data/vlm_hidden_states']  # lazy, reads on access
-            self._vlm_sl = vlm_zarr['data/vlm_seq_len']
-            print(f"VLM features on disk (lazy): hs={self._vlm_hs.shape}, sl={self._vlm_sl.shape}")
-            print(f"  RAM saved: ~{self._vlm_hs.nbytes / 1e9:.1f} GB kept on NVMe instead of RAM")
+            self._vlm_hs = vlm_zarr['data/vlm_hidden_states'][:]   # ← add [:]
+            self._vlm_sl = vlm_zarr['data/vlm_seq_len'][:]         # ← add [:]
+            print(f"VLM features EAGERLY loaded into RAM: hs={self._vlm_hs.shape}, sl={self._vlm_sl.shape}")
+            print(f"  RAM used: ~{self._vlm_hs.nbytes / 1e9:.1f} GB")
 
         # -----------------------------------------------------
         # 3. Setup Sampler & Masks
