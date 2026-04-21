@@ -71,8 +71,8 @@ class MetaworldDataset(BaseDataset):
             vlm_zarr = zarr.open(zarr_path, mode='r')
             self._vlm_hs = vlm_zarr['data/vlm_hidden_states']
             self._vlm_sl = vlm_zarr['data/vlm_seq_len']
-            self._vlm_hs.flags.writeable = False   
-            self._vlm_sl.flags.writeable = False   
+            # self._vlm_hs.flags.writeable = False   
+            # self._vlm_sl.flags.writeable = False   
 
         # -----------------------------------------------------
         # 3. Setup Sampler & Masks
