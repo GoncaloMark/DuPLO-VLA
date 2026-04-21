@@ -177,21 +177,22 @@ class MetaworldDataset(BaseDataset):
         agent_pos = sample['state'].astype(np.float32)
         point_cloud = sample['point_cloud'].astype(np.float32)
 
-        # Now these are integers! Just cast them properly.
-        instruction_id = int(sample['instruction'])
-        task_id = int(sample['task_name'])
-        
-        # Keep episode_id logic as it was, assuming it's already numeric
-        if isinstance(sample['episode_id'], np.ndarray):
-            episode_id = int(sample['episode_id'][0])
-        else:
-            episode_id = int(sample['episode_id'])
+        # Helper to safely grab the scalar ID from a sequence array
+        def _extract_id(value):
+            if isinstance(value, np.ndarray) or isinstance(value, list):
+                return int(value[0])
+            return int(value)
+
+        # Safely extract the first ID from the horizon sequence
+        instruction_id = _extract_id(sample['instruction'])
+        task_id = _extract_id(sample['task_name'])
+        episode_id = _extract_id(sample['episode_id'])
 
         obs = {
             'point_cloud': point_cloud,
             'agent_pos': agent_pos,
-            'instruction_id': instruction_id, # Changed key name for clarity
-            'task_id': task_id,               # Changed key name for clarity
+            'instruction_id': instruction_id,
+            'task_id': task_id,
             'episode_id': episode_id,
         }
 
