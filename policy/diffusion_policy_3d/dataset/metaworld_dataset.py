@@ -33,7 +33,7 @@ class MetaworldDataset(BaseDataset):
 
         # Small arrays go into RAM. VLM hidden states stay on disk.
         ram_keys = ['state', 'action', 'point_cloud', 'instruction',
-                    'task_name', 'episode_id', 'img']
+                    'task_name', 'episode_id']
 
         self.use_precomputed_vlm = use_precomputed_vlm
         self._vlm_hs = None
@@ -56,13 +56,12 @@ class MetaworldDataset(BaseDataset):
         else:
             self.replay_buffer = ReplayBuffer.copy_from_path(zarr_path, keys=ram_keys)
 
-        # -----------------------------------------------------
-        # 2. Open VLM arrays lazily on disk (not loaded into RAM)
-        # -----------------------------------------------------
         if use_precomputed_vlm:
             vlm_zarr = zarr.open(zarr_path, mode='r')
             self._vlm_hs = vlm_zarr['data/vlm_hidden_states'][:]   # ← add [:]
             self._vlm_sl = vlm_zarr['data/vlm_seq_len'][:]         # ← add [:]
+            self._vlm_hs.flags.writeable = False   # ← add this
+            self._vlm_sl.flags.writeable = False   # ← add this
             print(f"VLM features EAGERLY loaded into RAM: hs={self._vlm_hs.shape}, sl={self._vlm_sl.shape}")
             print(f"  RAM used: ~{self._vlm_hs.nbytes / 1e9:.1f} GB")
 
@@ -191,7 +190,6 @@ class MetaworldDataset(BaseDataset):
     def _sample_to_data(self, sample):
         agent_pos = sample['state'].astype(np.float32)
         point_cloud = sample['point_cloud'].astype(np.float32)
-        rgb_image = sample['img'].astype(np.uint8)
 
         instruction = self._extract_scalar_string(sample['instruction'])
         task_name = self._extract_scalar_string(sample['task_name'])
@@ -202,7 +200,6 @@ class MetaworldDataset(BaseDataset):
             'agent_pos': agent_pos,
             'instruction': instruction,
             'task_name': task_name,
-            'rgb_image': rgb_image,
             'episode_id': episode_id,
         }
 
