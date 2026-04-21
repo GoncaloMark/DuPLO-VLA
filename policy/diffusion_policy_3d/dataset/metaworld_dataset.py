@@ -56,14 +56,23 @@ class MetaworldDataset(BaseDataset):
         else:
             self.replay_buffer = ReplayBuffer.copy_from_path(zarr_path, keys=ram_keys)
 
+        from diffusion_policy_3d.dataset.vocabulary import TASK_TO_ID, INSTRUCTION_TO_ID 
+        
+        raw_instructions = self.replay_buffer['instruction'][:]
+        raw_tasks = self.replay_buffer['task_name'][:]
+        
+        inst_ids = np.array([INSTRUCTION_TO_ID[str(s)] for s in raw_instructions], dtype=np.int32)
+        task_ids = np.array([TASK_TO_ID[str(s)] for s in raw_tasks], dtype=np.int32)
+        
+        self.replay_buffer.data['instruction'] = inst_ids
+        self.replay_buffer.data['task_name'] = task_ids
+
         if use_precomputed_vlm:
             vlm_zarr = zarr.open(zarr_path, mode='r')
-            self._vlm_hs = vlm_zarr['data/vlm_hidden_states'][:]   # ← add [:]
-            self._vlm_sl = vlm_zarr['data/vlm_seq_len'][:]         # ← add [:]
-            self._vlm_hs.flags.writeable = False   # ← add this
-            self._vlm_sl.flags.writeable = False   # ← add this
-            print(f"VLM features loaded into RAM (read-only): hs={self._vlm_hs.shape}")
-            print(f"  RAM used: ~{self._vlm_hs.nbytes / 1e9:.1f} GB")
+            self._vlm_hs = vlm_zarr['data/vlm_hidden_states']
+            self._vlm_sl = vlm_zarr['data/vlm_seq_len']
+            self._vlm_hs.flags.writeable = False   
+            self._vlm_sl.flags.writeable = False   
 
         # -----------------------------------------------------
         # 3. Setup Sampler & Masks
@@ -168,15 +177,21 @@ class MetaworldDataset(BaseDataset):
         agent_pos = sample['state'].astype(np.float32)
         point_cloud = sample['point_cloud'].astype(np.float32)
 
-        instruction = self._extract_scalar_string(sample['instruction'])
-        task_name = self._extract_scalar_string(sample['task_name'])
-        episode_id = int(self._extract_scalar_string(sample['episode_id']))
+        # Now these are integers! Just cast them properly.
+        instruction_id = int(sample['instruction'])
+        task_id = int(sample['task_name'])
+        
+        # Keep episode_id logic as it was, assuming it's already numeric
+        if isinstance(sample['episode_id'], np.ndarray):
+            episode_id = int(sample['episode_id'][0])
+        else:
+            episode_id = int(sample['episode_id'])
 
         obs = {
             'point_cloud': point_cloud,
             'agent_pos': agent_pos,
-            'instruction': instruction,
-            'task_name': task_name,
+            'instruction_id': instruction_id, # Changed key name for clarity
+            'task_id': task_id,               # Changed key name for clarity
             'episode_id': episode_id,
         }
 
