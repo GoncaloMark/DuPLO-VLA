@@ -102,9 +102,9 @@ class VisualTaskPlanner(nn.Module):
             + LATENT_COV_REG_WEIGHT * cov_loss
         )
         return loss, {
-            'contrastive': contrastive.item(),
-            'var_reg': var_loss.item(),
-            'cov_reg': cov_loss.item(),
+            'contrastive': contrastive,
+            'var_reg': var_loss,
+            'cov_reg': cov_loss,
         }
 
     def extract_features_batch(self, images, texts, training=False, return_all_layers=True):
