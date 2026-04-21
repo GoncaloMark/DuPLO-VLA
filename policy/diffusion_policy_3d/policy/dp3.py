@@ -391,7 +391,7 @@ class DP3(BasePolicy):
         
 
         loss_dict = {
-                'bc_loss': loss.item(),
+                'bc_loss': loss,
             }
 
         # print(f"t2-t1: {t2-t1:.3f}")
