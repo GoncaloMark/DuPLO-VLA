@@ -31,6 +31,9 @@ class MetaworldDataset(BaseDataset):
             ):
         super().__init__()
 
+        # Save the path so workers can lazy-load the Zarr later
+        self.zarr_path = zarr_path
+        
         # Small arrays go into RAM. VLM hidden states stay on disk.
         ram_keys = ['state', 'action', 'point_cloud', 'instruction',
                     'task_name', 'episode_id']
@@ -56,6 +59,9 @@ class MetaworldDataset(BaseDataset):
         else:
             self.replay_buffer = ReplayBuffer.copy_from_path(zarr_path, keys=ram_keys)
 
+        # -----------------------------------------------------
+        # 2. Eradicate Strings to prevent RAM CoW duplication
+        # -----------------------------------------------------
         from diffusion_policy_3d.dataset.vocabulary import TASK_TO_ID, INSTRUCTION_TO_ID 
         
         raw_instructions = self.replay_buffer['instruction'][:]
@@ -67,12 +73,8 @@ class MetaworldDataset(BaseDataset):
         self.replay_buffer.data['instruction'] = inst_ids
         self.replay_buffer.data['task_name'] = task_ids
 
-        if use_precomputed_vlm:
-            vlm_zarr = zarr.open(zarr_path, mode='r')
-            self._vlm_hs = vlm_zarr['data/vlm_hidden_states']
-            self._vlm_sl = vlm_zarr['data/vlm_seq_len']
-            # self._vlm_hs.flags.writeable = False   
-            # self._vlm_sl.flags.writeable = False   
+        # NOTE: We DO NOT open the VLM zarr here anymore. 
+        # Opening it here causes the num_workers deadlock.
 
         # -----------------------------------------------------
         # 3. Setup Sampler & Masks
@@ -105,6 +107,16 @@ class MetaworldDataset(BaseDataset):
         self.randomize_update_interval = randomize_update_interval
         self.rng = np.random.RandomState(seed)
 
+    def _init_zarr_worker(self):
+        """
+        Lazy-loads the Zarr pointers on the first call by each DataLoader worker.
+        This prevents file handle locks and multiprocessing deadlocks.
+        """
+        if self.use_precomputed_vlm and self._vlm_hs is None:
+            vlm_zarr = zarr.open(self.zarr_path, mode='r')
+            self._vlm_hs = vlm_zarr['data/vlm_hidden_states']
+            self._vlm_sl = vlm_zarr['data/vlm_seq_len']
+
     def get_validation_dataset(self):
         val_set = copy.copy(self)
         val_set.sampler = SequenceSampler(
@@ -130,13 +142,6 @@ class MetaworldDataset(BaseDataset):
 
     def __len__(self) -> int:
         return len(self.sampler)
-
-    def _extract_scalar_string(self, value) -> str:
-        if isinstance(value, np.ndarray):
-            value = value.tolist()
-        if isinstance(value, list):
-            value = value[0]
-        return str(value)
 
     def _load_vlm_sequence(self, idx):
         """
@@ -213,6 +218,10 @@ class MetaworldDataset(BaseDataset):
         return latent_update_mask, latent_group_id
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        # 1. Initialize Zarr pointer cleanly for this specific worker process
+        self._init_zarr_worker()
+
+        # 2. Proceed as normal
         sample = self.sampler.sample_sequence(idx)
         data   = self._sample_to_data(sample)
 
