@@ -274,10 +274,10 @@ class LatentTaskEncoder(nn.Module):
         # Pooled vector for SSL losses. Note: we mean-pool the POST-gate
         # sequence so VICReg also sees the real scale the policy sees;
         # at init this is zero, and VICReg's variance term will immediately
-        # start pushing the gate open. That's by design — we want the SSL
+        # start pushing the gate open. That's by design, we want the SSL
         # losses to actively work to open the gate.
         latent_vec = latent_seq.mean(dim=1)                   # (B, latent_dim)
-        latent_normed = F.normalize(latent_vec, dim=-1)
+        latent_normed = F.normalize(latent_vec, dim=-1, eps=1e-8)
 
         out = {
             "latent_seq":    latent_seq,
