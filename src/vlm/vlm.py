@@ -52,7 +52,7 @@ class VisualTaskPlanner(nn.Module):
                 model_name, torch_dtype=torch.bfloat16, device_map="auto",
             )
             self.processor = Qwen3VLProcessor.from_pretrained(model_name)
-            vlm_dim = self.vlm.config.hidden_size
+            vlm_dim = self.vlm.config.text_config.hidden_size
 
         # LatentTaskEncoder lives in bfloat16 to match the VLM's dtype
         self.task_encoder = LatentTaskEncoder(
