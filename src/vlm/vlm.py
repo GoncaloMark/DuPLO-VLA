@@ -78,20 +78,35 @@ class VisualTaskPlanner(nn.Module):
     # ------------------------------------------------------------------ #
     def _compute_encoder_loss(self, out_dict: dict, episode_ids):
         latent_normed = out_dict["latent_normed"].float()
-        raw_latent = out_dict["latent"].float()
-
         contrastive = self.contrastive_loss(latent_normed, episode_ids)
-        var_loss, cov_loss = vicreg_loss(raw_latent)
+        
+        # Pass the sequence (B, 32, 512) to the updated vicreg_loss 
+        # to fix query collapse at the data level
+        raw_latent_seq = out_dict["latent_seq"].float()
+        var_loss, cov_loss = vicreg_loss(raw_latent_seq)
+
+        # Query Orthogonality Loss
+        # This pushes the 32 query vectors themselves to be different
+        q = self.task_encoder.q_pooler.queries  # (32, hidden_dim)
+        q_norm = torch.nn.functional.normalize(q, dim=-1)
+        sim = q_norm @ q_norm.T # (32, 32) matrix
+        
+        # Penalty for similarity between different queries
+        # We subtract the identity matrix so we only penalize off-diagonal (inter-query) similarity
+        ortho_loss = (sim - torch.eye(sim.shape[0], device=q.device)).pow(2).mean()
 
         total = (
             self.contrastive_weight * contrastive
             + LATENT_VAR_REG_WEIGHT * var_loss
             + LATENT_COV_REG_WEIGHT * cov_loss
+            + 0.1 * ortho_loss
         )
+
         return total, {
             "contrastive": contrastive,
             "var_reg":     var_loss,
             "cov_reg":     cov_loss,
+            "ortho_reg":   ortho_loss,  
             "gate":        out_dict["gate_value"],
         }
 

@@ -72,7 +72,7 @@ class QPooler(nn.Module):
 
         # Learned queries (order-invariant set)
         self.queries = nn.Parameter(torch.empty(num_queries, hidden_dim))
-        nn.init.trunc_normal_(self.queries, std=0.02)
+        nn.init.trunc_normal_(self.queries, std=0.2)
 
         # Cross-attention: queries attend into concatenated memory
         self.query_norm = nn.LayerNorm(hidden_dim)
@@ -344,19 +344,17 @@ class TemporalContrastiveLoss(nn.Module):
 
 
 def vicreg_loss(latent: torch.Tensor, eps: float = 1e-4):
-    """
-    Variance-covariance regularization. Operates on (B, D) latent vectors.
-    Returns (var_loss, cov_loss).
-
-    Variance term pushes each feature's std above 1 (prevents collapse).
-    Covariance term pushes off-diagonal correlations toward 0 (decorrelates).
-    """
+    if latent.ndim == 3:
+        # B = Batch, Q = Queries, D = Latent Dim (512)
+        B, Q, D = latent.shape
+        latent = latent.reshape(B * Q, D) 
     z = latent - latent.mean(dim=0, keepdim=True)
     std = torch.sqrt(z.var(dim=0) + eps)
     var_loss = F.relu(1.0 - std).mean()
 
-    D = z.shape[1]
+    D_dim = z.shape[1]
     cov = (z.T @ z) / max(z.shape[0] - 1, 1)
     off_diag = cov - torch.diag(torch.diagonal(cov))
-    cov_loss = off_diag.pow(2).sum() / D
+    cov_loss = off_diag.pow(2).sum() / D_dim
+    
     return var_loss, cov_loss
