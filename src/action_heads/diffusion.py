@@ -406,3 +406,131 @@ class RDTPolicy(nn.Module):
     # ------------------------------------------------------------------ #
     def forward(self, *args, **kwargs):
         return self.compute_loss(*args, **kwargs)
+    
+    def load_pretrained(
+        self,
+        source,
+        key: str = "ema_policy",
+        strict: bool = True,
+        map_location: str = "cpu",
+    ):
+        """
+        Load pre-trained weights into self.
+    
+        Args:
+            source: one of
+                - path to a .pt / .pth checkpoint (str or Path)
+                - an already-loaded dict (result of torch.load)
+                - a raw state_dict (flat dict of tensors)
+            key: which sub-dict inside a checkpoint to use.
+                Common choices from the DuPLO training script:
+                * "ema_policy" — EMA copy (preferred for eval)
+                * "policy"     — live, non-EMA weights
+                Ignored if `source` is already a raw state_dict.
+            strict: passed through to load_state_dict. Set False to tolerate
+                missing or unexpected keys (e.g. when evaluating an older
+                checkpoint after an architecture tweak — but verify the
+                mismatch is harmless).
+            map_location: where torch.load lands tensors before copying.
+                "cpu" is safe; the subsequent copy into the module will
+                move them to the right device/dtype automatically.
+    
+        Returns:
+            (missing_keys, unexpected_keys) from load_state_dict, for
+            inspection. With strict=True an error is raised on mismatch.
+        """
+        import torch
+        from pathlib import Path
+    
+        # 1) Normalize `source` to a state_dict
+        if isinstance(source, (str, Path)):
+            obj = torch.load(str(source), map_location=map_location)
+        else:
+            obj = source
+    
+        if isinstance(obj, dict) and key in obj:
+            state_dict = obj[key]
+        elif isinstance(obj, dict) and all(
+            isinstance(v, torch.Tensor) for v in obj.values()
+        ):
+            # Already a raw state_dict
+            state_dict = obj
+        elif isinstance(obj, dict):
+            available = [k for k in obj.keys() if not k.startswith("_")]
+            raise KeyError(
+                f"Checkpoint has no key '{key}'. Available keys: {available}. "
+                f"Pass key=... to pick a different one, or pass a raw state_dict."
+            )
+        else:
+            raise TypeError(f"Unsupported source type: {type(obj)}")
+    
+        # 2) Match dtype/device of the module before load
+        target_dtype  = next(self.parameters()).dtype
+        target_device = next(self.parameters()).device
+        state_dict = {
+            k: v.to(device=target_device, dtype=target_dtype)
+            if v.is_floating_point() else v.to(device=target_device)
+            for k, v in state_dict.items()
+        }
+    
+        # 3) Load
+        missing, unexpected = self.load_state_dict(state_dict, strict=strict)
+    
+        if missing or unexpected:
+            print(f"[RDTPolicy.load_pretrained] missing: {missing}")
+            print(f"[RDTPolicy.load_pretrained] unexpected: {unexpected}")
+        else:
+            print(f"[RDTPolicy.load_pretrained] loaded {len(state_dict)} tensors "
+                f"from key='{key}'")
+    
+        return missing, unexpected
+    
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint_path,
+        key: str = "ema_policy",
+        strict: bool = True,
+        map_location: str = "cpu",
+        **kwargs,
+    ):
+        """
+        Construct an RDTPolicy and load pre-trained weights in one call.
+    
+        All RDTPolicy.__init__ args must be passed via **kwargs and must
+        match the values used during training. Specifically:
+            action_dim, horizon, state_dim, cond_dims, cond_seq_lens,
+            hidden_dim, depth, num_heads, num_train_timesteps,
+            num_inference_timesteps, prediction_type, beta_schedule.
+    
+        If any architectural value mismatches the checkpoint, load_state_dict
+        will raise a shape error (with strict=True) or silently load the
+        wrong subset (with strict=False).
+    
+        Example:
+            policy = RDTPolicy.from_checkpoint(
+                "duplo_pusht_epoch_100.pt",
+                key            = "ema_policy",
+                action_dim     = 2,
+                horizon        = 16,
+                state_dim      = 4,
+                cond_dims      = {"latent": 512},
+                cond_seq_lens  = {},
+                hidden_dim     = 512,
+                depth          = 6,
+                num_heads      = 8,
+                num_train_timesteps     = 1000,
+                num_inference_timesteps = 16,
+                prediction_type         = "sample",
+            )
+            policy.eval()
+        """
+        policy = cls(**kwargs)
+        policy.load_pretrained(
+            checkpoint_path,
+            key          = key,
+            strict       = strict,
+            map_location = map_location,
+        )
+        return policy
+
