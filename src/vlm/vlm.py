@@ -219,3 +219,128 @@ class VisualTaskPlanner(nn.Module):
         if self.vlm is not None:
             self.vlm.eval()   # VLM stays in eval; only encoder trains
         return self
+
+    def load_encoder_weights(
+        self,
+        source,
+        key: str = "ema_encoder",
+        strict: bool = True,
+        map_location: str = "cpu",
+    ):
+        """
+        Load pre-trained weights into self.task_encoder.
+
+        Args:
+            source: one of
+                - path to a .pt / .pth checkpoint (str or Path)
+                - an already-loaded dict (torch.load result)
+                - a raw state_dict (the flat dict of tensors you'd pass to
+                load_state_dict directly).
+            key: which sub-dict inside a checkpoint contains the encoder weights.
+                Common choices based on your training script:
+                * "ema_encoder"    — EMA copy (usually what you want for eval)
+                * "latent_encoder" — live, non-EMA weights
+                Ignored if `source` already looks like a raw state_dict
+                (no wrapping).
+            strict: passed through to load_state_dict. Set False if you've
+                changed the encoder architecture and want to tolerate missing
+                or extra keys.
+            map_location: device to load the checkpoint onto. Default "cpu"
+                keeps the checkpoint weights on CPU and lets the module's
+                own device/dtype placement take over on load.
+
+        Returns:
+            The (missing_keys, unexpected_keys) tuple from load_state_dict,
+            for inspection. With strict=True an error is raised instead.
+        """
+        import torch
+        from pathlib import Path
+
+        # 1) Normalize `source` to a state_dict
+        if isinstance(source, (str, Path)):
+            obj = torch.load(str(source), map_location=map_location)
+        else:
+            obj = source
+
+        if isinstance(obj, dict) and key in obj:
+            state_dict = obj[key]
+        elif isinstance(obj, dict) and all(isinstance(v, torch.Tensor) for v in obj.values()):
+            # Already a raw state_dict
+            state_dict = obj
+        elif isinstance(obj, dict):
+            available = [k for k in obj.keys() if not k.startswith("_")]
+            raise KeyError(
+                f"Checkpoint has no key '{key}'. Available keys: {available}. "
+                f"Pass key=... to pick a different one, or pass a raw state_dict."
+            )
+        else:
+            raise TypeError(f"Unsupported source type: {type(obj)}")
+
+        # 2) Match dtype/device of the module before load so tensors copy cleanly
+        target_dtype = next(self.task_encoder.parameters()).dtype
+        target_device = next(self.task_encoder.parameters()).device
+        state_dict = {
+            k: v.to(device=target_device, dtype=target_dtype)
+            if v.is_floating_point() else v.to(device=target_device)
+            for k, v in state_dict.items()
+        }
+
+        # 3) Load
+        missing, unexpected = self.task_encoder.load_state_dict(state_dict, strict=strict)
+
+        if missing or unexpected:
+            print(f"[load_encoder_weights] missing: {missing}")
+            print(f"[load_encoder_weights] unexpected: {unexpected}")
+        else:
+            print(f"[load_encoder_weights] loaded {len(state_dict)} tensors "
+                f"from key='{key}'")
+
+        return missing, unexpected
+
+    # --------------------------------------------------------------------------- #
+    # Method 2: convenience factory that builds + loads in one call
+    # --------------------------------------------------------------------------- #
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint_path,
+        key: str = "ema_encoder",
+        load_vlm: bool = True,
+        strict: bool = True,
+        **kwargs,
+    ):
+        """
+        Build a VisualTaskPlanner with the VLM loaded and encoder weights
+        populated from a training checkpoint.
+
+        Args:
+            checkpoint_path: path to the .pt file.
+            key: which state_dict inside the checkpoint to use
+                ("ema_encoder" or "latent_encoder").
+            load_vlm: whether to load the Qwen3-VL model (needed for live
+                eval that runs the VLM; not needed if you're only using
+                plan_from_features with pre-extracted features).
+            strict: passed through to load_state_dict.
+            **kwargs: forwarded to __init__ (e.g. latent_dim, vlm_dim,
+                num_sampled_layers, q_hidden_dim, num_pooling_queries,
+                num_attention_heads, dropout, gate_output).
+
+        The encoder hyperparameters passed via **kwargs must match the
+        architecture used during training — otherwise load_state_dict will
+        complain about shape mismatches.
+
+        Example (eval):
+            planner = VisualTaskPlanner.from_checkpoint(
+                "duplo_pusht_epoch_700.pt",
+                key="ema_encoder",
+                load_vlm=True,
+                num_pooling_queries=32,   # match the value you trained with
+                latent_dim=512,
+            )
+            planner.eval()
+        """
+        planner = cls(load_vlm=load_vlm, **kwargs)
+        planner.load_encoder_weights(
+            checkpoint_path, key=key, strict=strict,
+        )
+        return planner
