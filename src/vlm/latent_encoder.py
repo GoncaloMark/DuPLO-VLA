@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 
 # --------------------------------------------------------------------------- #
-# RMSNorm helper (standalone so we don't depend on torch version)
+# RMSNorm helper
 # --------------------------------------------------------------------------- #
 class RMSNorm(nn.Module):
     """
@@ -26,7 +26,7 @@ class RMSNorm(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# Q-Pooler: per-layer norm + projection, cross-attention into learned queries
+# Q-Pooler — unchanged from previous version
 # --------------------------------------------------------------------------- #
 class QPooler(nn.Module):
     """
@@ -34,16 +34,6 @@ class QPooler(nn.Module):
     normalizes and projects each one independently, concatenates them into
     one long memory sequence, and uses learned queries to cross-attend into
     that memory.
-
-    Args:
-        input_dim:     width of the raw VLM hidden states (e.g. 3072 for
-                       Qwen3-VL-4B — pass self.vlm.config.hidden_size).
-        hidden_dim:    pooler internal dim.
-        num_queries:   number of learned query vectors (order-invariant set).
-        num_heads:     attention heads in cross-attention.
-        num_layers:    number of VLM layers being sampled. Must match the
-                       length of the first dim of `all_hidden_states`.
-        dropout:       dropout in attention and FFN.
     """
 
     def __init__(
@@ -59,10 +49,6 @@ class QPooler(nn.Module):
         self.num_queries = num_queries
         self.num_layers = num_layers
 
-        # Per-layer RMSNorm + linear projection. Each sampled VLM layer
-        # gets its own parameters so the pooler can handle different
-        # magnitude statistics at different depths without the final-norm
-        # trick.
         self.layer_norms = nn.ModuleList(
             [RMSNorm(input_dim) for _ in range(num_layers)]
         )
@@ -70,11 +56,9 @@ class QPooler(nn.Module):
             [nn.Linear(input_dim, hidden_dim) for _ in range(num_layers)]
         )
 
-        # Learned queries (order-invariant set)
         self.queries = nn.Parameter(torch.empty(num_queries, hidden_dim))
         nn.init.trunc_normal_(self.queries, std=0.2)
 
-        # Cross-attention: queries attend into concatenated memory
         self.query_norm = nn.LayerNorm(hidden_dim)
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=hidden_dim,
@@ -83,7 +67,6 @@ class QPooler(nn.Module):
             dropout=dropout,
         )
 
-        # FFN refinement
         self.ffn_norm = nn.LayerNorm(hidden_dim)
         self.ffn = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4),
@@ -94,25 +77,9 @@ class QPooler(nn.Module):
 
     def forward(
         self,
-        all_hidden_states: list[torch.Tensor] | torch.Tensor,
-        key_padding_mask: torch.Tensor | None = None,
+        all_hidden_states,
+        key_padding_mask=None,
     ):
-        """
-        Args:
-            all_hidden_states: either
-              - a list/tuple of length num_layers, each (B, L_text, input_dim),
-              - or a stacked tensor (B, num_layers, L_text, input_dim) as
-                produced by the feature extractor.
-            key_padding_mask: optional (B, L_text) bool — True positions are
-                VALID. This module internally converts to the MultiheadAttention
-                convention (True = mask out).
-
-        Returns:
-            pooled:       (B, num_queries, hidden_dim)
-            attn_weights: (B, num_queries, L_total) — attention weights over
-                          concatenated memory. Useful for debugging / viz.
-        """
-        # Normalize input format to a list of per-layer tensors
         if isinstance(all_hidden_states, torch.Tensor):
             assert all_hidden_states.dim() == 4, (
                 "Expected (B, num_layers, L, D) if passing a stacked tensor; "
@@ -127,72 +94,49 @@ class QPooler(nn.Module):
 
         B = layer_list[0].size(0)
 
-        # Per-layer norm + projection
         projected = []
         for i, h in enumerate(layer_list):
-            h = self.layer_norms[i](h)             # (B, L, input_dim)
-            h = self.layer_projs[i](h)             # (B, L, hidden_dim)
+            h = self.layer_norms[i](h)
+            h = self.layer_projs[i](h)
             projected.append(h)
-
-        # Concatenate into one memory sequence: (B, num_layers * L, hidden_dim)
         memory = torch.cat(projected, dim=1)
 
-        # Build the attention mask over the concatenated memory.
-        # MultiheadAttention wants True = "ignore this key". Our incoming
-        # convention (from the extractor) is True = "valid", so invert.
         attn_key_padding = None
         if key_padding_mask is not None:
-            # Replicate the per-layer mask across layers (each layer sees
-            # the same text token validity).
             mask_valid = torch.cat([key_padding_mask] * self.num_layers, dim=1)
             attn_key_padding = ~mask_valid.bool()
 
-        # Cross-attention: queries attend into memory
-        queries = self.queries.unsqueeze(0).expand(B, -1, -1)   # (B, Q, hidden)
+        queries = self.queries.unsqueeze(0).expand(B, -1, -1)
         q_input = self.query_norm(queries)
         attended, attn_weights = self.cross_attn(
-            query=q_input,
-            key=memory,
-            value=memory,
+            query=q_input, key=memory, value=memory,
             key_padding_mask=attn_key_padding,
-            need_weights=True,
-            average_attn_weights=True,
+            need_weights=True, average_attn_weights=True,
         )
         x = queries + attended
-
-        # FFN refinement
         x = x + self.ffn(self.ffn_norm(x))
 
         return x, attn_weights
 
 
 # --------------------------------------------------------------------------- #
-# Full latent encoder: Q-Pooler -> latent sequence + pooled vector + gate
+# LatentTaskEncoder — gate init 0.1, pre-gate output exposed
 # --------------------------------------------------------------------------- #
 class LatentTaskEncoder(nn.Module):
     """
-    Wraps the Q-Pooler and produces all three outputs downstream code needs:
+    Wraps the Q-Pooler and produces all the outputs downstream code needs:
 
-        latent_seq:    (B, num_queries, latent_dim)  — policy conditioning
-        latent:        (B, latent_dim)               — VICReg
-        latent_normed: (B, latent_dim)               — contrastive
-
-    A zero-init learnable gate scales latent_seq so the planner's output
-    starts at zero. The diffusion policy will effectively ignore the latent
-    at init and the gate will open during joint training. This is the
-    stability trick from ThinkJEPA / AdaLN-zero applied at the planner boundary.
+        latent_seq:           (B, num_queries, latent_dim) post-gate, for policy
+        latent_seq_pre_gate:  (B, num_queries, latent_dim) pre-gate, for SSL
+        latent:               (B, latent_dim) mean of post-gate
+        latent_normed:        (B, latent_dim) F.normalize of latent
 
     Args:
-        vlm_hidden_dim: width of raw VLM layer outputs (e.g. 3072).
-        num_layers:     how many VLM layers the Q-Pooler consumes.
-        q_hidden_dim:   Q-Pooler internal width.
-        latent_dim:     downstream latent width (what the policy sees).
-        num_pooling_queries: number of learned queries.
-        num_attention_heads: attention heads.
-        dropout:        dropout.
-        gate_output:    if True, apply zero-init tanh gate to latent_seq.
-                        Turn OFF for ablations that want to measure raw
-                        planner behavior without the gate.
+        gate_init: initial value for output_gate. Default 0.1.
+                   tanh(0.1) ~= 0.0997, so the post-gate latent has ~10%
+                   magnitude at start — enough for VICReg/policy gradients
+                   to push the gate without being at a zero-gradient
+                   fixed point.
     """
 
     def __init__(
@@ -205,6 +149,7 @@ class LatentTaskEncoder(nn.Module):
         num_attention_heads: int = 8,
         dropout: float = 0.1,
         gate_output: bool = True,
+        gate_init: float = 0.1,            # NEW: initial value for output_gate
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -218,9 +163,6 @@ class LatentTaskEncoder(nn.Module):
             dropout=dropout,
         )
 
-        # Per-query MLP head: Q-Pooler hidden width -> latent_dim.
-        # Applied independently per query (as an nn.Linear over the last dim),
-        # so structural per-query information is preserved.
         self.encoder = nn.Sequential(
             nn.Linear(q_hidden_dim, 1024),
             nn.LayerNorm(1024),
@@ -230,61 +172,53 @@ class LatentTaskEncoder(nn.Module):
             nn.LayerNorm(latent_dim),
         )
 
-        # Zero-init gate. At init: tanh(0) = 0 -> latent_seq is exactly zero.
-        # During training the scalar moves off zero and the gate opens.
         self.gate_output = gate_output
         if gate_output:
-            self.output_gate = nn.Parameter(torch.zeros(1))
+            self.output_gate = nn.Parameter(torch.tensor([float(gate_init)]))
 
     def forward(
         self,
-        vlm_hidden_states: list[torch.Tensor] | torch.Tensor,
-        key_padding_mask: torch.Tensor | None = None,
+        vlm_hidden_states,
+        key_padding_mask=None,
         return_attention_weights: bool = False,
     ) -> dict:
         """
-        Args:
-            vlm_hidden_states: see QPooler.forward.
-            key_padding_mask:  optional (B, L_text) bool; True = valid.
-            return_attention_weights: include Q-Pooler attention in output.
-
         Returns a dict with:
-            latent_seq:    (B, num_queries, latent_dim) for policy
-            latent:        (B, latent_dim) for VICReg
-            latent_normed: (B, latent_dim) for contrastive
-            pooled:        (B, num_queries, q_hidden_dim) — pre-encoder
-            gate_value:    scalar, current value of the output gate (for logging)
-            attention_weights (optional)
+            latent_seq:           (B, num_queries, latent_dim) post-gate, for policy
+            latent_seq_pre_gate:  (B, num_queries, latent_dim) pre-gate, for SSL
+            latent:               (B, latent_dim) mean of post-gate
+            latent_normed:        (B, latent_dim) F.normalize of latent
+            pooled:               (B, num_queries, q_hidden_dim) pre-encoder
+            gate_value:           detached scalar of tanh(output_gate)
+            attention_weights:    (optional)
         """
         pooled, attn_weights = self.q_pooler(
             vlm_hidden_states, key_padding_mask=key_padding_mask
         )
 
-        # Per-query latent: apply the encoder MLP over the last dim for every
-        # query independently. This preserves per-query specialization.
-        latent_seq = self.encoder(pooled)                     # (B, Q, latent_dim)
+        # Pre-gate output of the encoder MLP. SSL operates on this.
+        latent_seq_pre_gate = self.encoder(pooled)            # (B, Q, latent_dim)
 
-        # Zero-init gate on the sequence consumed by the policy
+        # Gate scales the policy-facing output without affecting the SSL path.
         if self.gate_output:
             gate = torch.tanh(self.output_gate)
-            latent_seq = latent_seq * gate
+            latent_seq = latent_seq_pre_gate * gate
         else:
-            gate = torch.tensor(1.0, device=latent_seq.device)
+            gate = torch.tensor(1.0, device=latent_seq_pre_gate.device)
+            latent_seq = latent_seq_pre_gate
 
-        # Pooled vector for SSL losses. Note: we mean-pool the POST-gate
-        # sequence so VICReg also sees the real scale the policy sees;
-        # at init this is zero, and VICReg's variance term will immediately
-        # start pushing the gate open. That's by design, we want the SSL
-        # losses to actively work to open the gate.
+        # Post-gate aggregates kept for downstream code that wants to see
+        # exactly what the policy consumes.
         latent_vec = latent_seq.mean(dim=1)                   # (B, latent_dim)
         latent_normed = F.normalize(latent_vec, dim=-1, eps=1e-8)
 
         out = {
-            "latent_seq":    latent_seq,
-            "latent":        latent_vec,
-            "latent_normed": latent_normed,
-            "pooled":        pooled,
-            "gate_value":    gate.detach(),
+            "latent_seq":          latent_seq,
+            "latent_seq_pre_gate": latent_seq_pre_gate,
+            "latent":              latent_vec,
+            "latent_normed":       latent_normed,
+            "pooled":              pooled,
+            "gate_value":          gate.detach(),
         }
         if return_attention_weights:
             out["attention_weights"] = attn_weights
@@ -292,28 +226,19 @@ class LatentTaskEncoder(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# Losses (unchanged from your version, included for completeness so you
-# can drop this file in and keep working)
+# Losses (unchanged)
 # --------------------------------------------------------------------------- #
 class TemporalContrastiveLoss(nn.Module):
     """
     Temporal InfoNCE: frames from the same episode are positives,
     frames from different episodes are negatives.
-
-    Inputs:
-        latents:     (B, D) — typically latent_normed
-        episode_ids: list or tensor of length B, int ids
     """
 
     def __init__(self, temperature: float = 0.1):
         super().__init__()
         self.temperature = temperature
 
-    def forward(
-        self,
-        latents: torch.Tensor,
-        episode_ids,
-    ) -> torch.Tensor:
+    def forward(self, latents, episode_ids):
         B = latents.shape[0]
         if B < 2:
             return latents.sum() * 0.0
@@ -344,10 +269,16 @@ class TemporalContrastiveLoss(nn.Module):
 
 
 def vicreg_loss(latent: torch.Tensor, eps: float = 1e-4):
+    """
+    Variance + covariance terms of VICReg, applied to a flattened latent.
+    Accepts either (B, D) or (B, Q, D) tensors. For (B, Q, D), reshapes
+    to (B*Q, D) so each query position counts as a sample for the
+    variance/covariance statistics.
+    """
     if latent.ndim == 3:
-        # B = Batch, Q = Queries, D = Latent Dim (512)
         B, Q, D = latent.shape
-        latent = latent.reshape(B * Q, D) 
+        latent = latent.reshape(B * Q, D)
+
     z = latent - latent.mean(dim=0, keepdim=True)
     std = torch.sqrt(z.var(dim=0) + eps)
     var_loss = F.relu(1.0 - std).mean()
@@ -356,5 +287,5 @@ def vicreg_loss(latent: torch.Tensor, eps: float = 1e-4):
     cov = (z.T @ z) / max(z.shape[0] - 1, 1)
     off_diag = cov - torch.diag(torch.diagonal(cov))
     cov_loss = off_diag.pow(2).sum() / D_dim
-    
+
     return var_loss, cov_loss
