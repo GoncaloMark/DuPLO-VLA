@@ -204,7 +204,6 @@ class LatentTaskEncoder(nn.Module):
         num_pooling_queries: int = 16,
         num_attention_heads: int = 8,
         dropout: float = 0.1,
-        gate_output: bool = True,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -229,12 +228,6 @@ class LatentTaskEncoder(nn.Module):
             nn.Linear(1024, latent_dim),
             nn.LayerNorm(latent_dim),
         )
-
-        # Zero-init gate. At init: tanh(0) = 0 -> latent_seq is exactly zero.
-        # During training the scalar moves off zero and the gate opens.
-        self.gate_output = gate_output
-        if gate_output:
-            self.output_gate = nn.Parameter(torch.zeros(1))
 
     def forward(
         self,
@@ -264,13 +257,6 @@ class LatentTaskEncoder(nn.Module):
         # query independently. This preserves per-query specialization.
         latent_seq = self.encoder(pooled)                     # (B, Q, latent_dim)
 
-        # Zero-init gate on the sequence consumed by the policy
-        if self.gate_output:
-            gate = torch.tanh(self.output_gate)
-            latent_seq = latent_seq * gate
-        else:
-            gate = torch.tensor(1.0, device=latent_seq.device)
-
         # Pooled vector for SSL losses. Note: we mean-pool the POST-gate
         # sequence so VICReg also sees the real scale the policy sees;
         # at init this is zero, and VICReg's variance term will immediately
@@ -284,66 +270,12 @@ class LatentTaskEncoder(nn.Module):
             "latent":        latent_vec,
             "latent_normed": latent_normed,
             "pooled":        pooled,
-            "gate_value":    gate.detach(),
         }
         if return_attention_weights:
             out["attention_weights"] = attn_weights
         return out
 
-
-# --------------------------------------------------------------------------- #
-# Losses (unchanged from your version, included for completeness so you
-# can drop this file in and keep working)
-# --------------------------------------------------------------------------- #
-class TemporalContrastiveLoss(nn.Module):
-    """
-    Temporal InfoNCE: frames from the same episode are positives,
-    frames from different episodes are negatives.
-
-    Inputs:
-        latents:     (B, D) — typically latent_normed
-        episode_ids: list or tensor of length B, int ids
-    """
-
-    def __init__(self, temperature: float = 0.1):
-        super().__init__()
-        self.temperature = temperature
-
-    def forward(
-        self,
-        latents: torch.Tensor,
-        episode_ids,
-    ) -> torch.Tensor:
-        B = latents.shape[0]
-        if B < 2:
-            return latents.sum() * 0.0
-
-        device = latents.device
-        if not isinstance(episode_ids, torch.Tensor):
-            ep_ids = torch.tensor(list(episode_ids), device=device)
-        else:
-            ep_ids = episode_ids.to(device)
-
-        same_ep = ep_ids.unsqueeze(0) == ep_ids.unsqueeze(1)
-        diag = torch.eye(B, dtype=torch.bool, device=device)
-        positives = same_ep & ~diag
-
-        valid_rows = positives.any(dim=1)
-        if not valid_rows.any():
-            return latents.sum() * 0.0
-
-        sim = (latents @ latents.T) / self.temperature
-        sim = sim.masked_fill(diag, float("-inf"))
-
-        log_probs = F.log_softmax(sim, dim=-1)
-        pos_counts = positives.float().sum(dim=-1, keepdim=True).clamp(min=1.0)
-        target = positives.float() / pos_counts
-
-        loss = -(target[valid_rows] * log_probs[valid_rows]).sum(dim=-1)
-        return loss.mean()
-
-
-def vicreg_loss(latent: torch.Tensor, eps: float = 1e-4):
+def vcreg_loss(latent: torch.Tensor, eps: float = 1e-4):
     if latent.ndim == 3:
         # B = Batch, Q = Queries, D = Latent Dim (512)
         B, Q, D = latent.shape
