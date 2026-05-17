@@ -5,8 +5,7 @@ from torch.amp import autocast
 
 from .latent_encoder import (
     LatentTaskEncoder,
-    TemporalContrastiveLoss,
-    vicreg_loss,
+    vcreg_loss,
 )
 
 LATENT_VAR_REG_WEIGHT = 1.0
@@ -39,7 +38,6 @@ class VisualTaskPlanner(nn.Module):
         num_attention_heads: int = 8,
         dropout: float = 0.1,
         contrastive_weight: float = 1.0,
-        gate_output: bool = True,
     ):
         super().__init__()
         self.vlm = None
@@ -63,10 +61,7 @@ class VisualTaskPlanner(nn.Module):
             num_pooling_queries=num_pooling_queries,
             num_attention_heads=num_attention_heads,
             dropout=dropout,
-            gate_output=gate_output,
         ).to(torch.bfloat16)
-
-        self.contrastive_loss = TemporalContrastiveLoss()
         self.contrastive_weight = contrastive_weight
 
         if freeze_vlm and self.vlm is not None:
@@ -83,7 +78,7 @@ class VisualTaskPlanner(nn.Module):
         # Pass the sequence (B, 32, 512) to the updated vicreg_loss 
         # to fix query collapse at the data level
         raw_latent_seq = out_dict["latent_seq"].float()
-        var_loss, cov_loss = vicreg_loss(raw_latent_seq)
+        var_loss, cov_loss = vcreg_loss(raw_latent_seq)
 
         # Query Orthogonality Loss
         # This pushes the 32 query vectors themselves to be different
