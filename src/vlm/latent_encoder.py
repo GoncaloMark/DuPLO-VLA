@@ -164,26 +164,40 @@ class LatentTaskEncoder(nn.Module):
 
 def vcreg_loss(latent_seq: torch.Tensor, eps: float = 1e-4):
     """
-    latent_seq shape: (B, Q, D) -> (Batch, Queries=64, Dim=512)
-    Calcula o VICReg ao longo do Batch para cada query de forma independente.
+    latent_seq shape: (B, Q, D) -> (Batch=512, Queries=64, Dim=512)
+    Calcula o VICReg ao longo do Batch para todas as queries em paralelo.
     """
     B, Q, D = latent_seq.shape
-    total_var_loss = 0.0
-    total_cov_loss = 0.0
     
-    for q in range(Q):
-        # Isola uma query de cada vez ao longo de todo o batch: (B, D)
-        z_q = latent_seq[:, q, :] 
-        z_q = z_q - z_q.mean(dim=0, keepdim=True)
-        
-        # Variância
-        std = torch.sqrt(z_q.var(dim=0) + eps)
-        total_var_loss += F.relu(1.0 - std).mean()
-        
-        # Covariância
-        cov = (z_q.T @ z_q) / max(B - 1, 1)
-        off_diag = cov - torch.diag(torch.diagonal(cov))
-        total_cov_loss += off_diag.pow(2).sum() / D
+    # 1. Centralizar os dados ao longo do Batch (Dimensão 0)
+    # z shape: (B, Q, D)
+    z = latent_seq - latent_seq.mean(dim=0, keepdim=True)
+    
+    # 2. CALCULO DA VARIÂNCIA (Vetorizado)
+    # var_q shape: (Q, D) -> calcula a variância de cada dimensão por query
+    var_q = z.var(dim=0, unbiased=True) 
+    std_q = torch.sqrt(var_q + eps)
+    
+    # Mantém o relu para empurrar o std para >= 1.0, depois tira a média global
+    var_loss = F.relu(1.0 - std_q).mean()
+    
+    # 3. CÁLCULO DA COVARIÂNCIA (Vetorizado usando BMM)
+    # Permuta para (Q, B, D) para podermos multiplicar a matriz do Batch por Query
+    z_perm = z.permute(1, 0, 2)  # Shape: (Q, B, D)
+    z_perm_T = z.permute(1, 2, 0) # Shape: (Q, D, B)
+    
+    # Batch Matrix Multiplication: (Q, D, B) @ (Q, B, D) -> (Q, D, D)
+    # Isto calcula a matriz de covariância (D x D) para as Q queries em paralelo!
+    cov = torch.bmm(z_perm_T, z_perm) / max(B - 1, 1) # Shape: (Q, D, D)
+    
+    # Criar uma máscara para isolar os elementos fora da diagonal (off-diagonal)
+    # eye shape: (D, D) -> expandido para (Q, D, D)
+    eye = torch.eye(D, device=latent_seq.device).unsqueeze(0).expand(Q, -1, -1)
+    off_diag = cov * (1.0 - eye)
+    
+    # Soma dos quadrados dos elementos fora da diagonal, dividido por D, tirando a média das Queries
+    cov_loss = off_diag.pow(2).sum(dim=(1, 2)).mean() / D
 
-    return total_var_loss / Q, total_cov_loss / Q
+    return var_loss, cov_loss
+
 
