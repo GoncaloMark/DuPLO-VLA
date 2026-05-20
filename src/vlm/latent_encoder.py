@@ -133,7 +133,7 @@ class LatentTaskEncoder(nn.Module):
             num_queries=num_pooling_queries,
             num_heads=num_attention_heads,
             num_layers=num_layers,
-            num_pooler_blocks=2, # 2 layers deep for better coordination
+            num_pooler_blocks=3, # 3 layers deep for better coordination
             dropout=dropout,
         )
 
