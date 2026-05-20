@@ -162,18 +162,28 @@ class LatentTaskEncoder(nn.Module):
             out["attention_weights"] = attn_weights
         return out
 
-def vcreg_loss(latent: torch.Tensor, eps: float = 1e-4):
-    if latent.ndim == 3:
-        # B = Batch, Q = Queries, D = Latent Dim (512)
-        B, Q, D = latent.shape
-        latent = latent.reshape(B * Q, D) 
-    z = latent - latent.mean(dim=0, keepdim=True)
-    std = torch.sqrt(z.var(dim=0) + eps)
-    var_loss = F.relu(1.0 - std).mean()
-
-    D_dim = z.shape[1]
-    cov = (z.T @ z) / max(z.shape[0] - 1, 1)
-    off_diag = cov - torch.diag(torch.diagonal(cov))
-    cov_loss = off_diag.pow(2).sum() / D_dim
+def vcreg_loss(latent_seq: torch.Tensor, eps: float = 1e-4):
+    """
+    latent_seq shape: (B, Q, D) -> (Batch, Queries=64, Dim=512)
+    Calcula o VICReg ao longo do Batch para cada query de forma independente.
+    """
+    B, Q, D = latent_seq.shape
+    total_var_loss = 0.0
+    total_cov_loss = 0.0
     
-    return var_loss, cov_loss
+    for q in range(Q):
+        # Isola uma query de cada vez ao longo de todo o batch: (B, D)
+        z_q = latent_seq[:, q, :] 
+        z_q = z_q - z_q.mean(dim=0, keepdim=True)
+        
+        # Variância
+        std = torch.sqrt(z_q.var(dim=0) + eps)
+        total_var_loss += F.relu(1.0 - std).mean()
+        
+        # Covariância
+        cov = (z_q.T @ z_q) / max(B - 1, 1)
+        off_diag = cov - torch.diag(torch.diagonal(cov))
+        total_cov_loss += off_diag.pow(2).sum() / D
+
+    return total_var_loss / Q, total_cov_loss / Q
+
