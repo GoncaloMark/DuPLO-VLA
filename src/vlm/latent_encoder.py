@@ -103,7 +103,7 @@ class QPooler(nn.Module):
         num_heads: int = 8,
         num_layers: int = 4,
         num_pooler_blocks: int = 3,
-        max_obs_horizon: int = 8,
+        max_obs_horizon: int = 1,
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -119,10 +119,13 @@ class QPooler(nn.Module):
 
         # Temporal embedding: one vector per obs-horizon slot.
         # Added to every token coming from a given slot.
-        self.temporal_embed = nn.Parameter(
-            torch.zeros(max_obs_horizon, hidden_dim)
-        )
-        nn.init.trunc_normal_(self.temporal_embed, std=0.02)
+        if self.max_obs_horizon > 1:
+            self.temporal_embed = nn.Parameter(
+                torch.zeros(max_obs_horizon, hidden_dim)
+            )
+            nn.init.trunc_normal_(self.temporal_embed, std=0.02)
+        else:
+            self.temporal_embed = None
 
         # Learnable queries.
         self.queries = nn.Parameter(torch.empty(num_queries, hidden_dim))
@@ -168,8 +171,9 @@ class QPooler(nn.Module):
             h = self.layer_projs[i](h)                  # (B, T, L, hidden_dim)
 
             # Add temporal embedding per slot.
-            t_emb = self.temporal_embed[:T].view(1, T, 1, self.hidden_dim)
-            h = h + t_emb                               # broadcast over L
+            if self.temporal_embed is not None:
+                t_emb = self.temporal_embed[:T].view(1, T, 1, self.hidden_dim)
+                h = h + t_emb # broadcast over L
 
             h = h.reshape(B, T * L, self.hidden_dim)
             layer_tokens.append(h)
