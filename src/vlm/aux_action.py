@@ -7,7 +7,7 @@ class ActionPredictorAuxHead(nn.Module):
         self.horizon = horizon
         self.action_dim = action_dim
 
-        # Learned pool query one vector that attends over all 64 latent slots
+        # Learned pool query one vector that attends over all latent slots
         self.pool_q = nn.Parameter(torch.empty(1, 1, latent_dim))
         nn.init.trunc_normal_(self.pool_q, std=0.02)
 
@@ -28,13 +28,9 @@ class ActionPredictorAuxHead(nn.Module):
         )
 
     def forward(self, latent_seq: torch.Tensor) -> torch.Tensor:
-        """
-        latent_seq: (B, Q, D)
-        Returns:    (B, horizon, action_dim)
-        """
         B = latent_seq.shape[0]
         kv = self.norm_kv(latent_seq)
         q = self.pool_q.expand(B, -1, -1)
-        pooled, _ = self.attn(q, kv, kv, need_weights=False)   # (B, 1, D)
-        pooled = pooled.squeeze(1)                              # (B, D)
+        pooled, _ = self.attn(q, kv, kv, need_weights=False)
+        pooled = pooled.squeeze(1)
         return self.net(pooled).view(B, self.horizon, self.action_dim)
