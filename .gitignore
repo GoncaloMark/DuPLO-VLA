@@ -47,7 +47,6 @@ output/
 
 check.py
 example.py
-*.mp4
 
 bin
 logs
