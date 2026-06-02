@@ -97,7 +97,7 @@ class QPooler(nn.Module):
         )
 
     def _build_memory(self, hidden_states, key_padding_mask):
-        B, NL, L, D = hidden_states.shape
+        B, _, NL, L, D = hidden_states.shape
         T = 1
         hidden_states = hidden_states.unsqueeze(1)  # (B, 1, NL, L, D)
         assert NL == self.num_layers
