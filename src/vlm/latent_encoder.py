@@ -1,7 +1,24 @@
+"""
+Latent task encoder with temporal-aware Q-Pooler.
+
+Changes vs. the previous version:
+  * Accepts both 4D `(B, num_layers, L, D)` and 5D `(B, T, num_layers, L, D)`
+    inputs. In the 5D case, the T frames are flattened into the memory
+    sequence with a learned temporal embedding so the queries can tell
+    "now" from "a few steps ago".
+  * RMSNorm everywhere (matching what Qwen3-VL uses internally).
+  * Query init std reduced to 0.02 (BERT-style) to avoid saturating
+    cross-attention softmax at init.
+  * No VICReg call inside the encoder. `vcreg_loss` is kept as a free
+    function for ablation, but the new training loop doesn't use it.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+# --------------------------------------------------------------------------- #
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -14,6 +31,8 @@ class RMSNorm(nn.Module):
         rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
         return (x * rms).to(dtype) * self.weight
 
+
+# --------------------------------------------------------------------------- #
 class QPoolerBlock(nn.Module):
     """
     Pre-norm block: queries do self-attn, then cross-attn into a memory
@@ -59,7 +78,23 @@ class QPoolerBlock(nn.Module):
         queries = queries + self.ffn(self.norm3(queries))
         return queries, attn_weights
 
+
+# --------------------------------------------------------------------------- #
 class QPooler(nn.Module):
+    """
+    Q-Former-style pooler with temporal awareness.
+
+    Memory construction:
+      input  : either (B, num_layers, L, D_vlm)
+                  or (B, T, num_layers, L, D_vlm)
+      per layer: RMSNorm + linear projection to hidden_dim
+      per (layer, time) slot: add a learned temporal embedding (only if T > 1)
+      concat across layers (and time): memory shape (B, M, hidden_dim)
+
+    Key padding mask follows the same flattening so the queries
+    correctly ignore padded text positions.
+    """
+
     def __init__(
         self,
         input_dim: int,
@@ -82,12 +117,19 @@ class QPooler(nn.Module):
             [nn.Linear(input_dim, hidden_dim) for _ in range(num_layers)]
         )
 
+        # Temporal embedding: one vector per obs-horizon slot.
+        # Added to every token coming from a given slot.
+        if self.max_obs_horizon > 1:
+            self.temporal_embed = nn.Parameter(
+                torch.zeros(max_obs_horizon, hidden_dim)
+            )
+            nn.init.trunc_normal_(self.temporal_embed, std=0.02)
+        else:
+            self.temporal_embed = None
+
         # Learnable queries.
         self.queries = nn.Parameter(torch.empty(num_queries, hidden_dim))
         nn.init.trunc_normal_(self.queries, std=0.02)
-
-        self.temporal_embed = nn.Parameter(torch.zeros(max_obs_horizon, hidden_dim))
-        nn.init.trunc_normal_(self.temporal_embed, std=0.02)
 
         self.blocks = nn.ModuleList(
             [
@@ -96,30 +138,55 @@ class QPooler(nn.Module):
             ]
         )
 
+    # ------------------------------------------------------------------ #
     def _build_memory(self, hidden_states, key_padding_mask):
-        B, _, NL, L, D = hidden_states.shape
-        T = 1
-        hidden_states = hidden_states.unsqueeze(1)  # (B, 1, NL, L, D)
-        assert NL == self.num_layers
+        """
+        hidden_states: 4D (B, num_layers, L, D) or 5D (B, T, num_layers, L, D)
+        key_padding_mask: matching shape minus the D axis, or None.
+
+        Returns:
+            memory          : (B, M, hidden_dim)
+            attn_key_padding: (B, M) bool — True = ignore, or None
+        """
+        is_temporal = hidden_states.dim() == 5
+
+        if is_temporal:
+            B, T, NL, L, D = hidden_states.shape
+            assert NL == self.num_layers, (
+                f"hidden_states has {NL} layers but encoder expects {self.num_layers}"
+            )
+            assert T <= self.max_obs_horizon, (
+                f"obs_horizon={T} exceeds max_obs_horizon={self.max_obs_horizon}"
+            )
+        else:
+            B, NL, L, D = hidden_states.shape
+            T = 1
+            hidden_states = hidden_states.unsqueeze(1)  # (B, 1, NL, L, D)
+            assert NL == self.num_layers
 
         layer_tokens = []  # list of (B, T*L, hidden_dim)
         for i in range(self.num_layers):
-            h = hidden_states[:, :, i] # (B, T, L, D)
+            h = hidden_states[:, :, i]                  # (B, T, L, D)
             h = self.layer_norms[i](h)
-            h = self.layer_projs[i](h) # (B, T, L, hidden_dim)
+            h = self.layer_projs[i](h)                  # (B, T, L, hidden_dim)
+
+            # Add temporal embedding per slot.
+            if self.temporal_embed is not None:
+                t_emb = self.temporal_embed[:T].view(1, T, 1, self.hidden_dim)
+                h = h + t_emb # broadcast over L
 
             h = h.reshape(B, T * L, self.hidden_dim)
             layer_tokens.append(h)
 
         # Concat over layers in the sequence dimension.
-        memory = torch.cat(layer_tokens, dim=1) # (B, num_layers * T * L, D)
+        memory = torch.cat(layer_tokens, dim=1)         # (B, num_layers * T * L, D)
 
         attn_key_padding = None
         if key_padding_mask is not None:
             # Accept (B, L), (B, T, L), or (B, num_layers, L), etc.
             mask = key_padding_mask.bool()
             if mask.dim() == 2:
-                # (B, L) repeat for T then for layers
+                # (B, L) — repeat for T then for layers
                 mask = mask.unsqueeze(1).expand(-1, T, -1)  # (B, T, L)
             if mask.dim() == 3:
                 # (B, T, L)
@@ -128,11 +195,11 @@ class QPooler(nn.Module):
                 raise ValueError(f"Unsupported mask shape {key_padding_mask.shape}")
             # repeat across layers
             mask = torch.cat([mask] * self.num_layers, dim=1)  # (B, num_layers*T*L)
-
             # MultiheadAttention's key_padding_mask: True = position is *ignored*.
             attn_key_padding = ~mask
         return memory, attn_key_padding
 
+    # ------------------------------------------------------------------ #
     def forward(self, hidden_states, key_padding_mask=None):
         memory, attn_key_padding = self._build_memory(hidden_states, key_padding_mask)
         B = memory.size(0)
@@ -143,7 +210,15 @@ class QPooler(nn.Module):
             x, last_attn = block(x, memory, memory_key_padding_mask=attn_key_padding)
         return x, last_attn
 
+
+# --------------------------------------------------------------------------- #
 class LatentTaskEncoder(nn.Module):
+    """
+    Wraps the Q-Pooler with a small MLP head and produces two outputs:
+      - latent_seq: (B, num_queries, latent_dim) — for cross-attn conditioning
+      - latent    : (B, latent_dim)              — for the aux action head
+    """
+
     def __init__(
         self,
         vlm_hidden_dim: int = 2560,
@@ -179,12 +254,15 @@ class LatentTaskEncoder(nn.Module):
             RMSNorm(latent_dim),
         )
 
-    def forward(self, vlm_hidden_states, key_padding_mask=None, return_attention_weights=False):
+    def forward(self, vlm_hidden_states, key_padding_mask=None,
+                return_attention_weights=False):
         pooled, attn_weights = self.q_pooler(
             vlm_hidden_states, key_padding_mask=key_padding_mask
-        ) # (B, Q, q_hidden_dim)
-        latent_seq = self.encoder(pooled) # (B, Q, latent_dim)
-        latent_vec = latent_seq.mean(dim=1) # (B, latent_dim)
+        )                                               # (B, Q, q_hidden_dim)
+        latent_seq = self.encoder(pooled)               # (B, Q, latent_dim)
+        # Pooled global vector for the aux head. Mean over queries —
+        # since queries are order-invariant slots this is the natural choice.
+        latent_vec = latent_seq.mean(dim=1)             # (B, latent_dim)
         latent_normed = F.normalize(latent_vec, dim=-1, eps=1e-8)
 
         out = {
