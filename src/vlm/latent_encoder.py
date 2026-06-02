@@ -86,6 +86,9 @@ class QPooler(nn.Module):
         self.queries = nn.Parameter(torch.empty(num_queries, hidden_dim))
         nn.init.trunc_normal_(self.queries, std=0.02)
 
+        self.temporal_embed = nn.Parameter(torch.zeros(max_obs_horizon, hidden_dim))
+        nn.init.trunc_normal_(self.temporal_embed, std=0.02)
+
         self.blocks = nn.ModuleList(
             [
                 QPoolerBlock(hidden_dim, num_heads, dropout)
